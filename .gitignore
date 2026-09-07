@@ -1,0 +1,5 @@
+.venv/
+models/
+recordings/
+__pycache__/
+*.log
