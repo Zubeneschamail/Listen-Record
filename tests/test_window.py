@@ -10,6 +10,166 @@ from app import App
 
 
 class WindowFlowTests(unittest.TestCase):
+    def test_two_speaker_drafts_finalize_in_place_and_restore_sources(self):
+        from unittest.mock import Mock
+        with patch("app.GlobalHotkey"):
+            root = tk.Tk()
+            app = App(root)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app.session = Path(folder) / "dual.jsonl"
+                app.show_preview({"source": "system", "text": "对方草稿"})
+                app.show_preview({"source": "microphone", "text": "我的草稿"})
+                theirs = app.chat.bubbles["draft:system"]
+                mine = app.chat.bubbles["draft:microphone"]
+                app.events.put(("segment", {"start": 0, "end": 1, "source": "system", "text": "对方定稿"}))
+                app.poll()
+                self.assertIs(app.chat.bubbles[0], theirs)
+                self.assertIs(app.chat.bubbles["draft:microphone"], mine)
+                self.assertFalse(theirs.draft)
+                self.assertNotIn("草稿", app.session.read_text(encoding="utf-8"))
+                app.events.put(("segment", {"start": 1, "end": 2, "source": "microphone", "text": "我的定稿"}))
+                app.poll()
+                self.assertIs(app.chat.bubbles[1], mine)
+                self.assertTrue(mine.mine)
+                self.assertFalse(theirs.mine)
+                app.open_qa()
+                app.qa.ask = Mock()
+                app.bubble_select_text(1, "定稿")
+                app.ask_selected()
+                self.assertEqual(app.qa.ask.call_args.args[0], "定稿")
+                app.restore_session(app.session)
+                self.assertTrue(app.chat.bubbles[1].mine)
+                self.assertFalse(app.chat.bubbles[0].mine)
+                app.copy()
+                self.assertEqual(root.clipboard_get(), "对方定稿\n我的定稿")
+        finally:
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call("after", "info"):
+                root.after_cancel(identifier)
+            root.destroy()
+
+    def test_settings_dialog_preserves_layout_and_values(self):
+        with patch("app.GlobalHotkey"):
+            root = tk.Tk()
+            app = App(root)
+        try:
+            root.update()
+            geometry = root.geometry()
+            app.toggle_settings()
+            root.update()
+            self.assertEqual(root.geometry(), geometry)
+            self.assertTrue(app.settings_window.winfo_viewable())
+            self.assertEqual(root.grab_current(), app.settings_window)
+            app.model.current(1)
+            app.hotwords.set("大模型,见闻")
+            app.hide_settings()
+            root.update()
+            self.assertIsNone(root.grab_current())
+            self.assertFalse(app.settings_window.winfo_viewable())
+            app.toggle_settings()
+            root.update()
+            self.assertEqual(app.model.current(), 1)
+            self.assertEqual(app.hotwords.get(), "大模型,见闻")
+            app.events.put(("hotkey_status", (True, "")))
+            app.poll()
+            self.assertFalse(app.hotkey_hint.winfo_manager())
+            self.assertFalse(app.hotkey_error.winfo_manager())
+            app.hide_settings()
+        finally:
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call("after", "info"):
+                root.after_cancel(identifier)
+            root.destroy()
+
+    def test_inline_draft_replaces_in_place_without_becoming_a_question(self):
+        from unittest.mock import Mock
+        with patch("app.GlobalHotkey"):
+            root = tk.Tk()
+            app = App(root)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app.session = Path(folder) / "session.jsonl"
+                app.events.put(("segment", {"start": 0, "end": 1, "text": "已确认的正文。"}))
+                app.poll()
+                app.open_qa()
+                app.qa.ask = Mock()
+                confirmed_range = app.text.tag_ranges("row:0")
+                app.show_preview("这是临时错词")
+                draft_start = str(app.text.tag_ranges("draft")[0])
+                app.show_preview("这是临时字幕，正在更新。")
+                self.assertEqual(str(app.text.tag_ranges("draft")[0]), draft_start)
+                self.assertNotIn("临时错词", app.text.get("1.0", "end"))
+                self.assertIn("正在更新", app.text.get("1.0", "end"))
+                self.assertEqual(app.text.tag_ranges("row:0"), confirmed_range)
+                self.assertFalse(any(tag.startswith("row:") for tag in app.text.tag_names(draft_start)))
+                app.text.tag_add("sel", *app.text.tag_ranges("draft"))
+                app.ask_selected()
+                app.qa.ask.assert_not_called()
+                self.assertNotIn("正在更新", app.session.read_text(encoding="utf-8"))
+                app.events.put(("segment", {"start": 1, "end": 2, "text": "这是最终修正的字幕。"}))
+                app.poll()
+                text = app.text.get("1.0", "end")
+                self.assertFalse(app.text.tag_ranges("draft"))
+                self.assertNotIn("正在更新", text)
+                self.assertEqual(text.count("最终修正"), 1)
+                self.assertEqual(str(app.text.tag_ranges("row:1")[0]), draft_start)
+                self.assertEqual(len(app.rows), 2)
+        finally:
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call("after", "info"):
+                root.after_cancel(identifier)
+            root.destroy()
+
+    def test_ctrl_click_combines_nonadjacent_rows_in_one_request(self):
+        from unittest.mock import Mock
+        with patch("app.GlobalHotkey"):
+            root = tk.Tk()
+            app = App(root)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app.session = Path(folder) / "session.jsonl"
+                app.open_qa()
+                app.qa.ask = Mock()
+                for i, text in enumerate(["第一问？", "中间说明", "第三问？"]):
+                    app.events.put(("segment", {"start": i, "end": i+1, "text": text}))
+                app.poll()
+                root.update()
+                def click_row(i, state=4):
+                    widget = app.chat.bubbles[i].text
+                    widget.event_generate("<ButtonPress-1>", x=4, y=4, state=state)
+                    widget.event_generate("<ButtonRelease-1>", x=4, y=4, state=state)
+                click_row(2)
+                click_row(0)
+                self.assertEqual(app.multi_rows, {0, 2})
+                app.qa.ask.assert_not_called()
+                self.assertEqual(app.ask_selected_button.cget("text"), "发送 2 条")
+                app.ask_selected_button.invoke()
+                app.qa.ask.assert_called_once_with("第一问？\n第三问？", ["第一问？", "第三问？"])
+                old = app.qa.generation
+                click_row(2)
+                self.assertEqual(app.multi_rows, {0})
+                app.handle_qa((old, "answer", ("旧问题", "迟到答案")))
+                self.assertEqual(app.qa_answer, "")
+                app.qa.ask.reset_mock()
+                click_row(1, state=0)
+                self.assertFalse(app.multi_rows)
+                app.qa.ask.assert_called_once()
+                self.assertEqual(app.qa.ask.call_args.args[0], "中间说明")
+                click_row(0)
+                app.clear_conversation()
+                self.assertFalse(app.multi_rows)
+        finally:
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call("after", "info"):
+                root.after_cancel(identifier)
+            root.destroy()
+
     def test_clear_conversation_preserves_recording_and_cancels_old_answer(self):
         with patch("app.GlobalHotkey"):
             root = tk.Tk()
@@ -34,6 +194,7 @@ class WindowFlowTests(unittest.TestCase):
                 self.assertEqual(app.draft_text, "")
                 self.assertEqual(app.qa_text.get("1.0", "end").strip(), "")
                 self.assertTrue(app.qa.enabled)
+                self.assertTrue(app.engine.context_reset.is_set())
                 app.handle_qa((old, "answer", ("旧问题", "迟到的答案")))
                 self.assertEqual(app.qa_answer, "")
                 app.events.put(("segment", {"start": 1, "end": 2, "text": "清空后的文字"}))
@@ -114,7 +275,7 @@ class WindowFlowTests(unittest.TestCase):
                 app.qa.ask.reset_mock()
                 app.select_question("如何训练？", [2])
                 app.qa.ask.assert_not_called()
-                app.text.tag_add("sel", "1.0", "3.end")
+                app.text.tag_add("sel", "1.0", app.text.tag_ranges("body:2")[-1])
                 app.ask_selected()
                 self.assertEqual(app.qa.ask.call_args.args[0], "这是背景。\n什么是模型？\n如何训练？")
                 self.assertNotIn("00:", app.qa.ask.call_args.args[0])
@@ -158,7 +319,7 @@ class WindowFlowTests(unittest.TestCase):
                 self.assertIn("14:58:21", displayed)
                 self.assertNotIn("00:00:02", displayed)
                 self.assertEqual(app.draft_text, "")
-                self.assertFalse(app.preview_frame.winfo_manager())
+                self.assertFalse(app.text.tag_ranges("draft"))
                 self.assertNotIn("错词", displayed)
                 saved = json.loads(app.session.read_text(encoding="utf-8"))
                 self.assertEqual(saved["captured_at"], row["captured_at"])

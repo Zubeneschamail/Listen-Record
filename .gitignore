@@ -3,3 +3,7 @@ models/
 recordings/
 __pycache__/
 *.log
+recognition-settings.json
+recognition-settings.tmp
+/见闻-*.txt
+/见闻-*.srt

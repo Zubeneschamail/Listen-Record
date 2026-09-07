@@ -5,6 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 from app import load_model, clean_caption
+from recognition import RecognitionContext, DEFAULT_HOTWORDS
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="base")
@@ -12,9 +13,10 @@ parser.add_argument("--language", default="en", choices=["en", "zh"])
 parser.add_argument("--streaming", action="store_true")
 parser.add_argument("--force-cuts", action="store_true", help="Stress-test overlap with forced 5s cuts")
 parser.add_argument("--preview", action="store_true", help="Exercise provisional then final decoding")
+parser.add_argument("--guided", action="store_true", help="Use hotwords, recent context and adaptive final beam")
 args = parser.parse_args()
 
-with tempfile.TemporaryDirectory(prefix="shengji-test-") as folder:
+with tempfile.TemporaryDirectory(prefix="jianwen-test-") as folder:
     wav = Path(folder) / "speech.wav"
     # This path is generated locally, never sourced from user text.
     script = """$voice = New-Object -ComObject SAPI.SpVoice
@@ -48,18 +50,19 @@ $stream.Close()
         final_rows, drafts = [], []
         audio_clock = [0.0]
         preview = DraftPreview(clock=lambda: audio_clock[0])
+        guidance = RecognitionContext(DEFAULT_HOTWORDS) if args.guided else None
 
         def confirm(batch):
             chunks.extend(batch)
             for chunk in batch:
-                final_rows.extend(decode_chunk(model, assembler, chunk, args.language))
+                final_rows.extend(decode_chunk(model, assembler, chunk, args.language, guidance))
                 preview.defer()
 
         for offset in range(0, len(sound), 1600):
             audio_clock[0] = offset / 16000
             confirm(splitter.push(sound[offset:offset + 1600], offset / 16000, 1000 + offset / 16000))
             if args.preview:
-                draft = preview.render(model, assembler, splitter, args.language)
+                draft = preview.render(model, assembler, splitter, args.language, guidance=guidance)
                 if draft:
                     drafts.append(clean_caption(draft))
         confirm(splitter.finish())

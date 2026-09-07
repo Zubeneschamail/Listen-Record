@@ -152,13 +152,20 @@ class WordAssembler:
         return output
 
 
-def decode_chunk(model, assembler, chunk, language):
+def decode_chunk(model, assembler, chunk, language, guidance=None, backlog=0):
+    started = time.monotonic()
+    options = guidance.options(chunk.start, backlog) if guidance else {"beam_size": 1}
     segments, _ = model.transcribe(
-        chunk.audio, language=language, beam_size=1,
+        chunk.audio, language=language, **options,
         vad_filter=True, vad_parameters={"min_silence_duration_ms": 600},
         word_timestamps=True, condition_on_previous_text=False, temperature=0,
         max_new_tokens=256, repetition_penalty=1.1, no_repeat_ngram_size=3)
-    return assembler.consume(chunk, segments)
+    rows = assembler.consume(chunk, segments)
+    if guidance:
+        rows = [(start, end, guidance.normalize(text), epoch) for start, end, text, epoch in rows]
+        guidance.commit(rows, chunk.start + len(chunk.audio) / RATE,
+                        time.monotonic() - started, len(chunk.audio) / RATE)
+    return rows
 
 
 class DraftPreview:
@@ -166,32 +173,40 @@ class DraftPreview:
         self.clock = clock
         self.last_finished = -float("inf")
         self.last_audio_end = -float("inf")
+        self.cooldown = 2.0
 
     def defer(self):
         self.last_finished = self.clock()
 
-    def render(self, model, assembler, segmenter, language, backlog=0, stopping=False):
+    def render(self, model, assembler, segmenter, language, backlog=0, stopping=False, guidance=None):
         end = segmenter.start + len(segmenter.audio) / RATE
-        if (stopping or backlog > 0.5 or self.clock() - self.last_finished < 2 or
+        if (stopping or backlog > 0.5 or self.clock() - self.last_finished < self.cooldown or
                 end - self.last_audio_end < 1.6):
             return None
         chunk = segmenter.snapshot()
         if chunk is None:
             return None
         self.last_audio_end = end
+        started = self.clock()
         try:
             # A disposable assembler prevents provisional recognition from changing
             # final word ownership, deduplication or pending boundary phrases.
             if chunk.overlap or assembler.pending:
-                rows = decode_chunk(model, deepcopy(assembler), chunk, language)
+                draft_guidance = deepcopy(guidance)
+                if draft_guidance:
+                    draft_guidance.rtf = 1  # Preview always uses the inexpensive beam.
+                rows = decode_chunk(model, deepcopy(assembler), chunk, language, draft_guidance)
                 return "".join(row[2] for row in rows)
             # Drafts need no word alignment unless resolving a hard-cut overlap.
             # Omitting that pass reduces CPU work while final decoding stays unchanged.
+            options = guidance.options(chunk.start, draft=True) if guidance else {"beam_size": 1}
             segments, _ = model.transcribe(
-                chunk.audio, language=language, beam_size=1, vad_filter=True,
+                chunk.audio, language=language, **options, vad_filter=True,
                 word_timestamps=False, without_timestamps=True,
                 condition_on_previous_text=False, temperature=0,
                 max_new_tokens=256, repetition_penalty=1.1, no_repeat_ngram_size=3)
-            return "".join(segment.text for segment in segments)
+            text = "".join(segment.text for segment in segments)
+            return guidance.normalize(text) if guidance else text
         finally:
+            self.cooldown = min(6, max(2, (self.clock() - started) * 1.5))
             self.defer()
