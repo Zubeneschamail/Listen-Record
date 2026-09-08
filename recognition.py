@@ -39,7 +39,17 @@ def save_preferences(path, hotwords):
 
 class RecognitionContext:
     def __init__(self, hotwords=""):
-        self.terms = parse_hotwords(hotwords)
+        entries = parse_hotwords(hotwords)
+        self.corrections = {}
+        self.terms = []
+        for entry in entries:
+            if '=' in entry:
+                wrong, right = (part.strip() for part in entry.split('=', 1))
+                if wrong and right:
+                    self.corrections[wrong] = right
+                    self.terms.append(right)
+            else:
+                self.terms.append(entry)
         self.history = deque(maxlen=3)
         self.last_end = None
         self.rtf = 0.0
@@ -51,7 +61,7 @@ class RecognitionContext:
             self.history.clear()
         return dict(hotwords=", ".join(self.terms) or None,
                     initial_prompt=(" ".join(self.history)[-160:] or None) if not expired else None,
-                    beam_size=1 if draft or backlog >= 0.5 or self.rtf >= 0.65 else 3)
+                    beam_size=1 if draft or backlog >= 1.5 or self.rtf >= 0.65 else 3)
 
     def commit(self, rows, end, elapsed, duration):
         for _, _, text, _ in rows:
@@ -70,4 +80,7 @@ class RecognitionContext:
             compact = re.sub(r"\s+", "", term)
             pattern = r"(?<![A-Za-z0-9])" + r"\s*".join(map(re.escape, compact)) + r"(?![A-Za-z0-9])"
             text = re.sub(pattern, lambda _: term, text, flags=re.I)
+        if self.corrections:
+            pattern = '|'.join(re.escape(word) for word in sorted(self.corrections, key=len, reverse=True))
+            text = re.sub(pattern, lambda match: self.corrections[match.group()], text)
         return text

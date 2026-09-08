@@ -30,12 +30,13 @@ def distance(a, b):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="small")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--output", type=Path, default=Path("recordings/recognition-benchmark.json"))
     args = parser.parse_args()
     samples = ["我们正在讨论大模型，模型可以理解和生成文字。",
                "LangChain 和 LangGraph 有什么区别？MCP 用来连接工具。",
                "今天气温比较低，出门记得带上外套。"]
-    model = load_model(args.model)
+    model = load_model(args.model, device=args.device)
     results = []
     with tempfile.TemporaryDirectory(prefix="wenlu-benchmark-") as folder:
         audio = []

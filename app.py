@@ -16,8 +16,6 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import pyaudiowpatch as pa
 from scipy.signal import resample_poly
-from faster_whisper import WhisperModel
-from huggingface_hub.errors import LocalEntryNotFoundError
 from opencc import OpenCC
 from hotkey import GlobalHotkey
 from codex_qa import CodexQA
@@ -26,6 +24,8 @@ from recognition import RecognitionContext, read_preferences, save_preferences
 from scrollbars import SlimScrollbar
 from chat_view import ChatView
 from icon_button import IconButton
+from model_runtime import load_model
+from floating_caption import FloatingCaption
 
 ROOT = Path(__file__).resolve().parent
 SIMPLIFIED = OpenCC("t2s")
@@ -68,15 +68,6 @@ def mono_16k(audio, rate):
     mono = audio.mean(axis=1) if audio.ndim == 2 else audio
     divisor = math.gcd(int(rate), 16000)
     return resample_poly(mono, 16000 // divisor, int(rate) // divisor).astype(np.float32)
-
-
-def load_model(name):
-    options = dict(device="cpu", compute_type="int8", cpu_threads=6, num_workers=1,
-                   download_root=str(ROOT / "models"))
-    try:
-        return WhisperModel(name, local_files_only=True, **options)
-    except LocalEntryNotFoundError:
-        return WhisperModel(name, **options)
 
 
 def clean_caption(text):
@@ -165,7 +156,9 @@ class Transcriber:
             origin = time.monotonic()
             for stream in streams:
                 stream.start_stream()
-            self.emit("status", "正在转写 · " + " + ".join("系统声音" if x == "system" else "麦克风" for x in states))
+            backend = getattr(getattr(self.model, "model", None), "device", "cpu")
+            source_names = " + ".join("系统声音" if x == "system" else "麦克风" for x in states)
+            self.emit("status", f"正在转写 · {'GPU' if backend == 'cuda' else 'CPU'} · {source_names}")
 
             def transcribe(source, ready):
                 state = states[source]
@@ -370,9 +363,9 @@ class App:
         self.refresh_button = button(self.settings_panel, "刷新", self.refresh)
         self.refresh_button.grid(row=2, column=3, sticky="e", pady=(0, 8))
         ttk.Label(self.settings_panel, text="识别").grid(row=3, column=0, sticky="w", padx=(0, 12))
-        self.model = ttk.Combobox(self.settings_panel, state="readonly", width=16,
+        self.model = ttk.Combobox(self.settings_panel, state="readonly", width=23,
                                   style="Settings.TCombobox", font=("Microsoft YaHei UI", 9),
-                                  values=["small · 更准确", "base · 均衡", "tiny · 更快"])
+                                  values=["small · 轻量准确", "large-v3-turbo · 高性能", "base · 均衡", "tiny · 更快"])
         self.model.current(0)
         self.model.grid(row=3, column=1, sticky="ew", padx=(0, 8))
         self.language = ttk.Combobox(self.settings_panel, state="readonly", width=10,
@@ -388,10 +381,11 @@ class App:
         ttk.Label(self.settings_panel, text="问答使用已登录的 Codex · 开启后联网发送相关转写并消耗账号额度",
                   wraplength=460).grid(row=6, column=0, columnspan=4, sticky="w", pady=(16, 0))
         self.hotwords = tk.StringVar(value=read_preferences(ROOT / "recognition-settings.json"))
-        ttk.Label(self.settings_panel, text="热词").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(self.settings_panel, text="热词 / 纠错").grid(row=4, column=0, sticky="w", pady=(8, 0))
         self.hotwords_entry = ttk.Entry(self.settings_panel, textvariable=self.hotwords,
                                         style="Settings.TEntry", font=("Microsoft YaHei UI", 9))
-        self.hotwords_entry.grid(row=4, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        self.hotwords_entry.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+        ttk.Label(self.settings_panel, text="逗号分隔；定向纠错示例：大模形=大模型").grid(row=5, column=1, columnspan=3, sticky="w", pady=(4, 0))
         button(self.settings_panel, "完成", self.hide_settings, primary=True).grid(
             row=7, column=0, columnspan=4, sticky="e", pady=(16, 0))
 
@@ -934,22 +928,13 @@ class App:
         if self.caption_window and self.caption_window.winfo_exists():
             self.caption_window.lift()
             return
-        self.caption_window = tk.Toplevel(self.root)
-        self.caption_window.title("闻录 · 实时字幕")
-        self.caption_window.geometry("850x180")
-        self.caption_window.configure(bg="#17233a")
-        self.caption_window.attributes("-topmost", True)
-        self.caption = tk.Label(self.caption_window, text="等待转写…", bg="#17233a", fg="white",
-                                font=("Microsoft YaHei UI", 21), wraplength=800, padx=20, pady=20)
-        self.caption.pack(fill="both", expand=True)
-        self.caption_window.bind("<Configure>", lambda e: self.caption.configure(wraplength=max(200, e.width - 40))
-                                 if e.widget == self.caption_window else None)
+        self.caption_window = FloatingCaption(self.root)
         self.refresh_caption()
 
     def refresh_caption(self):
         if self.caption_window and self.caption_window.winfo_exists():
-            self.caption.configure(text=("临时 · " + self.draft_text) if self.draft_text else (self.last_caption or "等待转写…"),
-                                   fg="#A7D9FA" if self.draft_text else "white")
+            self.caption_window.set_text(self.draft_text or self.last_caption or "等待转写…",
+                                         draft=bool(self.draft_text))
 
     def show_preview(self, text, source=None, keep_bubble=False):
         if isinstance(text, dict):
@@ -1060,6 +1045,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--restore", type=Path)
     parser.add_argument("--qa", action="store_true")
+    parser.add_argument("--captions", action="store_true", help="Open floating captions on startup")
     parser.add_argument("--geometry", help="Window geometry when restoring a running view")
     args = parser.parse_args()
     app = App(tk.Tk())
@@ -1072,4 +1058,6 @@ if __name__ == "__main__":
             messagebox.showerror("恢复转写失败", str(exc))
     if args.qa:
         app.open_qa()
+    if args.captions:
+        app.open_caption()
     app.root.mainloop()

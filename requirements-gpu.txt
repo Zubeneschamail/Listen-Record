@@ -1,0 +1,3 @@
+# Optional Windows CUDA runtime; the application still supports CPU-only installs.
+nvidia-cublas-cu12==12.4.5.8; sys_platform == "win32"
+nvidia-cudnn-cu12>=9,<10; sys_platform == "win32"

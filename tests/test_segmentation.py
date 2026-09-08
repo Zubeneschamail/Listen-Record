@@ -47,7 +47,7 @@ class SegmentationTests(unittest.TestCase):
         segmenter.push(np.ones(2 * RATE, dtype=np.float32), 0, 1000)
         model = Mock()
         model.transcribe.return_value = (words((0, 1, "草稿")), None)
-        self.assertIsNone(preview.render(model, assembler, segmenter, "zh", backlog=1))
+        self.assertIsNone(preview.render(model, assembler, segmenter, "zh", backlog=0.2))
         self.assertIsNone(preview.render(model, assembler, segmenter, "zh", stopping=True))
         model.transcribe.assert_not_called()
         self.assertEqual(preview.render(model, assembler, segmenter, "zh"), "草稿")

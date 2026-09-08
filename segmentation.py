@@ -4,6 +4,7 @@ from copy import deepcopy
 import time
 import numpy as np
 from faster_whisper.vad import get_speech_timestamps, VadOptions
+from tokenizers import Tokenizer as TextTokenizer
 
 RATE = 16000
 
@@ -69,7 +70,9 @@ class PauseSegmenter:
             cut = None
             for index, speech in enumerate(ranges):
                 next_start = ranges[index + 1]["start"] if index + 1 < len(ranges) else len(self.audio)
-                if next_start - speech["end"] >= self.silence:
+                # Longer utterances can end at a shorter natural pause; never cut active speech.
+                required = min(self.silence, int(0.35 * RATE)) if speech["end"] >= 6 * RATE else self.silence
+                if next_start - speech["end"] >= required:
                     cut = speech["end"] + int(0.2 * RATE)
                     break
             if cut is not None and cut <= self.maximum:
@@ -152,14 +155,37 @@ class WordAssembler:
         return output
 
 
+def budget_prompt(model, options):
+    """Share a token budget between terms and history, reserving 256 output tokens."""
+    options = dict(options)
+    tokenizer = getattr(model, "hf_tokenizer", None)
+    if not isinstance(tokenizer, TextTokenizer):
+        return options  # Lightweight model adapters used by segmentation tests.
+    budget = max(0, model.max_length - 256 - 8)  # Language/task/timestamp control tokens.
+    hotwords = options.get("hotwords") or ""
+    history = options.get("initial_prompt")
+    # Keep complete UTF-8 text for hotwords; count the actual leading-space encoding.
+    limit = min(96, budget) if history else budget
+    while hotwords and len(tokenizer.encode(" " + hotwords.strip(), add_special_tokens=False).ids) > limit:
+        hotwords = hotwords[:-1].rstrip()
+    used = len(tokenizer.encode(" " + hotwords.strip(), add_special_tokens=False).ids) if hotwords else 0
+    if "hotwords" in options:
+        options["hotwords"] = hotwords or None
+    if history:
+        tokens = tokenizer.encode(" " + history.strip(), add_special_tokens=False).ids if isinstance(history, str) else list(history)
+        remaining = budget - used
+        options["initial_prompt"] = tokens[-remaining:] if remaining else None
+    return options
+
+
 def decode_chunk(model, assembler, chunk, language, guidance=None, backlog=0):
     started = time.monotonic()
-    options = guidance.options(chunk.start, backlog) if guidance else {"beam_size": 1}
+    options = budget_prompt(model, guidance.options(chunk.start, backlog) if guidance else {"beam_size": 1})
     segments, _ = model.transcribe(
         chunk.audio, language=language, **options,
         vad_filter=True, vad_parameters={"min_silence_duration_ms": 600},
         word_timestamps=True, condition_on_previous_text=False, temperature=0,
-        max_new_tokens=256, repetition_penalty=1.1, no_repeat_ngram_size=3)
+        max_new_tokens=256, repetition_penalty=1.0, no_repeat_ngram_size=0)
     rows = assembler.consume(chunk, segments)
     if guidance:
         rows = [(start, end, guidance.normalize(text), epoch) for start, end, text, epoch in rows]
@@ -180,8 +206,10 @@ class DraftPreview:
 
     def render(self, model, assembler, segmenter, language, backlog=0, stopping=False, guidance=None):
         end = segmenter.start + len(segmenter.audio) / RATE
-        if (stopping or backlog > 0.5 or self.clock() - self.last_finished < self.cooldown or
-                end - self.last_audio_end < 1.6):
+        # Budget previews more conservatively as the uncommitted utterance grows.
+        minimum_new_audio = max(1.6, min(3.0, len(segmenter.audio) / RATE / 4))
+        if (stopping or backlog > 0.1 or self.clock() - self.last_finished < self.cooldown or
+                end - self.last_audio_end < minimum_new_audio):
             return None
         chunk = segmenter.snapshot()
         if chunk is None:
@@ -199,12 +227,12 @@ class DraftPreview:
                 return "".join(row[2] for row in rows)
             # Drafts need no word alignment unless resolving a hard-cut overlap.
             # Omitting that pass reduces CPU work while final decoding stays unchanged.
-            options = guidance.options(chunk.start, draft=True) if guidance else {"beam_size": 1}
+            options = budget_prompt(model, guidance.options(chunk.start, draft=True) if guidance else {"beam_size": 1})
             segments, _ = model.transcribe(
                 chunk.audio, language=language, **options, vad_filter=True,
                 word_timestamps=False, without_timestamps=True,
                 condition_on_previous_text=False, temperature=0,
-                max_new_tokens=256, repetition_penalty=1.1, no_repeat_ngram_size=3)
+                max_new_tokens=256, repetition_penalty=1.0, no_repeat_ngram_size=0)
             text = "".join(segment.text for segment in segments)
             return guidance.normalize(text) if guidance else text
         finally:
