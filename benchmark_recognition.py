@@ -37,7 +37,7 @@ def main():
                "今天气温比较低，出门记得带上外套。"]
     model = load_model(args.model)
     results = []
-    with tempfile.TemporaryDirectory(prefix="jianwen-benchmark-") as folder:
+    with tempfile.TemporaryDirectory(prefix="wenlu-benchmark-") as folder:
         audio = []
         for i, text in enumerate(samples):
             wav = Path(folder) / f"sample-{i}.wav"

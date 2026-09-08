@@ -10,7 +10,7 @@ from app import App
 with patch("app.GlobalHotkey"):
     root = tk.Tk()
     app = App(root)
-root.title("见闻 · 问答界面验证")
+root.title("闻录 · 问答界面验证")
 root.geometry("560x380+650+150")
 app.hotkey_hint.configure(text="界面验证")
 app.start_button.configure(state="disabled")

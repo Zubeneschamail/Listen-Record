@@ -264,8 +264,8 @@ class App:
         self.settings_visible = False
         self.pinned = False
         self._drag_origin = None
-        root.title("见闻 · 系统声音实时转文字")
-        icon_path = ROOT / "assets" / "jianwen.ico"
+        root.title("闻录 · 系统声音实时转文字")
+        icon_path = ROOT / "assets" / "wenlu.ico"
         if icon_path.exists():
             root.iconbitmap(default=str(icon_path))
         root.geometry("560x380")
@@ -323,7 +323,7 @@ class App:
         self.brand_image = tk.PhotoImage(file=str(ROOT / "assets" / "logo-24.png"))
         brand = ttk.Label(header, image=self.brand_image)
         brand.pack(side="left", padx=(0, 7))
-        title = ttk.Label(header, text="见闻", foreground="#263044", font=("Microsoft YaHei UI", 12, "bold"))
+        title = ttk.Label(header, text="闻录", foreground="#263044", font=("Microsoft YaHei UI", 12, "bold"))
         title.pack(side="left", padx=(0, 12))
         hint = ttk.Label(header, text="", foreground="#bd544f")
         self.hotkey_hint = hint
@@ -345,7 +345,7 @@ class App:
 
         self.settings_window = tk.Toplevel(root)
         self.settings_window.withdraw()
-        self.settings_window.title("见闻 · 设置")
+        self.settings_window.title("闻录 · 设置")
         self.settings_window.transient(root)
         self.settings_window.resizable(False, False)
         self.settings_window.configure(bg="#e0e3ea")
@@ -813,7 +813,7 @@ class App:
         if self.multi_rows:
             indices = sorted(self.multi_rows)
             question = "\n".join(self.rows[i]["text"] for i in indices)
-            self.select_question(question, indices, keep_multi=True)
+            self.select_question(question, indices)
             return
         if self.bubble_selection:
             row_id, question = self.bubble_selection
@@ -838,38 +838,38 @@ class App:
         if parts:
             self.select_question("\n".join(parts).strip(), indices)
 
-    def select_question(self, question, indices, keep_multi=False):
+    def clear_question_selection(self):
+        self.multi_rows.clear()
+        self.bubble_selection = None
+        self.ask_selected_button.configure(text="发送所选")
+        self.text.tag_remove("qa_selected", "1.0", "end")
+        self.text.tag_remove("sel", "1.0", "end")
+        self.chat.highlight(set())
+
+    def select_question(self, question, indices):
         if not self.qa.enabled or not question or not indices:
             return
         if len(question) > 2400:
             self.qa_status.set("选中内容超过 2400 字，请减少选择后发送")
             return
-        if not keep_multi:
-            self.multi_rows.clear()
-            self.ask_selected_button.configure(text="发送所选")
         key = (tuple(indices), question)
         if key == self.qa_selection and self.qa.active:
+            self.clear_question_selection()
             return
         self.qa.reset()
         self.qa_selection = key
         self.qa_question, self.qa_answer = question, self.qa_cache.get(key, "")
-        self.text.tag_remove("qa_selected", "1.0", "end")
-        self.chat.highlight(set())
-        self.text.tag_remove("sel", "1.0", "end")
-        for i in indices:
-            ranges = self.text.tag_ranges(f"row:{i}")
-            if ranges:
-                self.text.tag_add("qa_selected", *ranges)
-        self.chat.highlight(set(indices))
         self.render_qa()
         if self.qa_answer:
             self.qa_status.set("")
+            self.clear_question_selection()
             return
         self.qa_status.set("正在回答…")
         # Only the selected passage and its preceding context go to Codex.
         context = ([r["text"] for r in self.rows[max(0, indices[0]-8):indices[0]]]
                    + [self.rows[i]["text"] for i in indices])
         self.qa.ask(question, context)
+        self.clear_question_selection()
 
     def render_qa(self):
         self.answer_copy_button.configure(state="normal" if self.qa_answer else "disabled")
@@ -922,7 +922,7 @@ class App:
             messagebox.showinfo("导出", "尚无转写文字。")
             return
         path = filedialog.asksaveasfilename(defaultextension=".txt",
-                  initialfile=datetime.now().strftime("见闻-%Y%m%d-%H%M%S.txt"),
+                  initialfile=datetime.now().strftime("闻录-%Y%m%d-%H%M%S.txt"),
                   filetypes=[("文本", "*.txt"), ("字幕", "*.srt")])
         if path:
             try:
@@ -935,7 +935,7 @@ class App:
             self.caption_window.lift()
             return
         self.caption_window = tk.Toplevel(self.root)
-        self.caption_window.title("见闻 · 实时字幕")
+        self.caption_window.title("闻录 · 实时字幕")
         self.caption_window.geometry("850x180")
         self.caption_window.configure(bg="#17233a")
         self.caption_window.attributes("-topmost", True)
@@ -1055,7 +1055,7 @@ class App:
 
 if __name__ == "__main__":
     import ctypes
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Jianwen.Desktop")
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Wenlu.Desktop")
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--restore", type=Path)

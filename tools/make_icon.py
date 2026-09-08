@@ -50,5 +50,5 @@ directory = []
 for size, payload in zip(sizes, payloads):
     directory.append(struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(payload), offset))
     offset += len(payload)
-(assets / "jianwen.ico").write_bytes(struct.pack("<HHH", 0, 1, len(sizes)) + b"".join(directory) + b"".join(payloads))
+(assets / "wenlu.ico").write_bytes(struct.pack("<HHH", 0, 1, len(sizes)) + b"".join(directory) + b"".join(payloads))
 print("Created pixel-fitted PNGs and ten-size Windows icon")

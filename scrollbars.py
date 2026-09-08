@@ -8,7 +8,9 @@ class SlimScrollbar(tk.Canvas):
         self.target = text
         self.first, self.last = 0.0, 1.0
         self.hover = self.dragging = False
-        self.thumb = self.create_line(6, 6, 6, 30, width=6, capstyle=tk.ROUND, fill="#cbd4de")
+        self.track = self.create_line(6, 10, 6, 30, width=2, capstyle=tk.ROUND,
+                                      fill="#f1f5f9", state="hidden")
+        self.thumb = self.create_line(6, 10, 6, 38, width=4, capstyle=tk.ROUND, fill="#dce3eb")
         self.bind("<Configure>", lambda e: self.draw())
         self.bind("<Enter>", lambda e: self.set_hover(True))
         self.bind("<Leave>", lambda e: self.set_hover(False))
@@ -28,17 +30,22 @@ class SlimScrollbar(tk.Canvas):
             self.draw()
 
     def metrics(self):
-        track = max(1, self.winfo_height() - 12)
+        track = max(1, self.winfo_height() - 20)
         visible = max(0, min(1, self.last-self.first))
-        size = min(track, max(24, track*visible))
+        size = min(track, max(28, track*visible))
         travel = track-size
-        top = 6 + travel * self.first / max(0.0001, 1-visible)
+        top = 10 + travel * self.first / max(0.0001, 1-visible)
         return top, size, travel, visible
 
     def draw(self):
         top, size, _, _ = self.metrics()
-        self.coords(self.thumb, 6, top+3, 6, max(top+3, top+size-3))
-        self.itemconfigure(self.thumb, fill="#007ACC" if self.dragging else "#8bb7d6" if self.hover else "#cbd4de")
+        active = self.hover or self.dragging
+        radius = 3 if active else 2
+        self.coords(self.track, 6, 10, 6, max(10, self.winfo_height()-10))
+        self.itemconfigure(self.track, state="normal" if active else "hidden")
+        self.coords(self.thumb, 6, top+radius, 6, max(top+radius, top+size-radius))
+        self.itemconfigure(self.thumb, width=radius*2,
+                           fill="#007ACC" if self.dragging else "#9dc3df" if self.hover else "#dce3eb")
 
     def set_hover(self, hover):
         self.hover = hover
@@ -47,7 +54,7 @@ class SlimScrollbar(tk.Canvas):
     def press(self, event):
         top, size, travel, visible = self.metrics()
         if not top <= event.y <= top+size and travel > 0:
-            value = (event.y-6-size/2)/travel*(1-visible)
+            value = (event.y-10-size/2)/travel*(1-visible)
             self.target.yview_moveto(max(0, min(1-visible, value)))
             self.first, self.last = self.target.yview()
         self.dragging = True

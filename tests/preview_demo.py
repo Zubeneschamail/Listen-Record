@@ -13,7 +13,7 @@ import time
 with tempfile.TemporaryDirectory() as folder, patch("app.GlobalHotkey"):
     root = tk.Tk()
     app = App(root)
-    root.title("见闻 · 临时字幕界面验证")
+    root.title("闻录 · 临时字幕界面验证")
     app.hotkey_hint.configure(text="界面验证")
     app.status.set("模拟文字，不录音 · 按回车确认句子")
     app.start_button.configure(state="disabled")

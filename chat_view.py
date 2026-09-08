@@ -11,14 +11,14 @@ class Bubble(tk.Frame):
         super().__init__(parent, bg=SURFACE)
         self.row, self.click, self.selected_text = row, click, selected_text
         self.mine = row.get("source") == "microphone"
-        self.normal = "#007ACC" if self.mine else "#EDF4FA"
+        self.normal = "#F0F1F3" if self.mine else "#EDF4FA"
         self.label = tk.Label(self, text=row.get("time", ""),
                               bg=SURFACE, fg="#a3adba", font=("Microsoft YaHei UI", 8))
         self.canvas = tk.Canvas(self, bg=SURFACE, bd=0, highlightthickness=0)
         self.text = tk.Text(self.canvas, wrap="char", font=("Microsoft YaHei UI", 10),
-                            bg=self.normal, fg="white" if self.mine else "#263044", bd=0, highlightthickness=0,
+                            bg=self.normal, fg="#263044", bd=0, highlightthickness=0,
                             padx=0, pady=0, spacing2=4, cursor="xterm", exportselection=False,
-                            selectborderwidth=0, selectbackground="#006BB3" if self.mine else "#DCECF8")
+                            selectborderwidth=0, selectbackground="#E0E4E9" if self.mine else "#DCECF8")
         self.text.insert("1.0", row["text"])
         self.text.configure(state="disabled")
         self.font = tkfont.Font(root=self, font=self.text.cget("font"))
@@ -31,7 +31,7 @@ class Bubble(tk.Frame):
         self.canvas.bind("<ButtonRelease-1>", self.release)
         self.draft = row.get("draft", False)
         if self.draft:
-            self.text.configure(fg="#BBDCF3" if self.mine else "#7896AD")
+            self.text.configure(fg="#8A929C" if self.mine else "#7896AD")
 
     def press(self, event):
         self.origin = (event.x, event.y)
@@ -58,7 +58,7 @@ class Bubble(tk.Frame):
             return
         self.layout_key = key
         font = self.font
-        limit = max(60, int((width-30)*.86)-28)
+        limit = max(60, int((width-30)*.86)-29)
         content = max(28, min(limit, max((font.measure(line) for line in self.row["text"].splitlines()), default=28)))
         line_count = 0
         for line in self.row["text"].split("\n"):
@@ -70,20 +70,22 @@ class Bubble(tk.Frame):
                     used = 0
                 used += advance
             line_count += count
-        height = line_count*(font.metrics("linespace")+4)+2
-        bubble_width, bubble_height = content+28, height+20
+        height = line_count*font.metrics("linespace") + max(0, line_count-1)*4 + 2
+        bubble_width, bubble_height = content+29, height+16
         x = width-bubble_width-12 if self.mine else 12
         self.canvas.place(x=x, y=8, width=bubble_width, height=bubble_height)
         self.label.place(x=12, y=bubble_height+11, width=width-24, height=16)
         self.label.configure(anchor="e" if self.mine else "w")
+        self.canvas.coords(self.text_id, 12 if self.mine else 17, 8)
         self.canvas.itemconfigure(self.text_id, width=content, height=height)
         self.canvas.delete("shape")
-        fill = ("#006BB3" if self.mine else "#DCECF8") if self.selected else self.normal
-        w, h, r = bubble_width, bubble_height, 9
+        fill = ("#E0E4E9" if self.mine else "#DCECF8") if self.selected else self.normal
+        w, h, r = bubble_width, bubble_height, 6
 
         def rounded(inset, radius, color):
             # Straight sides and true quarter-circle corners, without spline bulges.
-            x0, y0, x1, y1 = inset, inset, w-inset, h-inset
+            x0, y0 = (0 if self.mine else 5) + inset, inset
+            x1, y1 = w - (5 if self.mine else 0) - inset, h-inset
             self.canvas.create_rectangle(x0+radius, y0, x1-radius, y1,
                                          fill=color, outline="", tags="shape")
             self.canvas.create_rectangle(x0, y0+radius, x1, y1-radius,
@@ -94,8 +96,14 @@ class Bubble(tk.Frame):
                                        start=start, extent=90, fill=color, outline="", tags="shape")
 
         rounded(0, r, fill)
+        # A short, mirrored side notch aligned with the first line of text.
+        cy = 8 + font.metrics("linespace") / 2
+        edge = w-5 if self.mine else 5
+        tip = w if self.mine else 0
+        self.canvas.create_polygon(edge, cy-5, tip, cy, edge, cy+5,
+                                   fill=fill, outline="", tags="shape")
         self.canvas.tag_lower("shape")
-        foreground = ("#BBDCF3" if self.mine else "#7896AD") if self.draft else ("white" if self.mine else "#263044")
+        foreground = ("#8A929C" if self.mine else "#7896AD") if self.draft else "#263044"
         self.text.configure(bg=fill, fg=foreground, selectforeground=foreground)
         self.configure(height=bubble_height+32)
 

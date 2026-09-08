@@ -16,7 +16,7 @@ parser.add_argument("--preview", action="store_true", help="Exercise provisional
 parser.add_argument("--guided", action="store_true", help="Use hotwords, recent context and adaptive final beam")
 args = parser.parse_args()
 
-with tempfile.TemporaryDirectory(prefix="jianwen-test-") as folder:
+with tempfile.TemporaryDirectory(prefix="wenlu-test-") as folder:
     wav = Path(folder) / "speech.wav"
     # This path is generated locally, never sourced from user text.
     script = """$voice = New-Object -ComObject SAPI.SpVoice
