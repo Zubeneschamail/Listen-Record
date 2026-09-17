@@ -4,6 +4,8 @@ import tkinter as tk
 from tkinter import ttk
 
 PALETTE = {
+    '#15803d': '#4ADE80', '#2563eb': '#60A5FA',
+    '#b45309': '#FBBF24', '#b91c1c': '#F87171',
     'white': '#1C2430', '#ffffff': '#1C2430', '#f7f8fa': '#141B25',
     '#e0e3ea': '#303D50', '#eceef3': '#303D50', '#e2e5ed': '#354358',
     '#edf0f7': '#283447', '#f1f3f7': '#222C3B', '#f1f5f9': '#283447',

@@ -45,6 +45,7 @@ class Bubble(tk.Frame):
         self.label.configure(bg=surface, fg=color('#a3adba', dark))
         self.text.configure(selectbackground=color('#E0E4E9' if self.mine else '#DCECF8', dark))
         self.layout_key = None
+        self.measured_text = None
 
     def press(self, event):
         self.origin = (event.x, event.y)
@@ -71,19 +72,26 @@ class Bubble(tk.Frame):
             return
         self.layout_key = key
         font = self.font
+        # Font metrics are independent of the available width. Crossing into Tk
+        # once per character on every resize made long conversations very slow.
+        if self.measured_text != self.row['text']:
+            self.measured_text = self.row['text']
+            advances = {char: font.measure(char) for char in set(self.measured_text) if char != '\n'}
+            self.line_advances = [[advances[char] for char in line] for line in self.measured_text.split('\n')]
+            self.natural_width = max((font.measure(line) for line in self.measured_text.splitlines()), default=28)
+            self.line_height = font.metrics('linespace')
         limit = max(60, int((width-30)*.86)-29)
-        content = max(28, min(limit, max((font.measure(line) for line in self.row["text"].splitlines()), default=28)))
+        content = max(28, min(limit, self.natural_width))
         line_count = 0
-        for line in self.row["text"].split("\n"):
+        for line in self.line_advances:
             used, count = 0, 1
-            for char in line:
-                advance = font.measure(char)
+            for advance in line:
                 if used+advance > content and used:
                     count += 1
                     used = 0
                 used += advance
             line_count += count
-        height = line_count*font.metrics("linespace") + max(0, line_count-1)*4 + 2
+        height = line_count*self.line_height + max(0, line_count-1)*4 + 2
         bubble_width, bubble_height = content+29, height+16
         x = width-bubble_width-12 if self.mine else 12
         self.canvas.place(x=x, y=8, width=bubble_width, height=bubble_height)
@@ -110,7 +118,7 @@ class Bubble(tk.Frame):
 
         rounded(0, r, fill)
         # A short, mirrored side notch aligned with the first line of text.
-        cy = 8 + font.metrics("linespace") / 2
+        cy = 8 + self.line_height / 2
         edge = w-5 if self.mine else 5
         tip = w if self.mine else 0
         self.canvas.create_polygon(edge, cy-5, tip, cy, edge, cy+5,

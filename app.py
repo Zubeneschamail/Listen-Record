@@ -306,13 +306,14 @@ class App:
         root.option_add("*TCombobox*Listbox.relief", "flat")
         style.configure("Slim.Horizontal.TProgressbar", background="#007ACC", troughcolor="#edf0f7",
                         borderwidth=0, thickness=2)
-        frame = ttk.Frame(root, padding=(12, 8, 12, 12))
+        frame = self.main_frame = ttk.Frame(root, padding=(12, 8, 12, 12))
         frame.pack(fill="both", expand=True, padx=1, pady=1)
 
         def button(parent, text, command, primary=False, width=None):
             surface = parent.cget("bg") if isinstance(parent, tk.Frame) else "#f7f8fa"
             icons = {"设置": "settings", "复制全文": "copy", "复制": "copy", "···": "more",
-                     "刷新": "refresh", "×": "close", "—": "minimize"}
+                     "刷新": "refresh", "×": "close", "—": "minimize", "发送所选": "send",
+                     "开始转写": "waveform", "停止转写": "waveform"}
             factory = IconButton if text in icons else tk.Button
             widget = factory(parent, **({"icon": icons[text]} if text in icons else {}),
                              text=text, command=command, relief="flat", bd=0,
@@ -326,7 +327,7 @@ class App:
             widget.bind("<Leave>", lambda e: widget.configure(bg=self.theme_color(normal_bg)), add="+")
             return widget
 
-        header = ttk.Frame(frame)
+        header = self.header = ttk.Frame(frame)
         header.pack(fill="x", pady=(0, 8))
         self.brand_image = tk.PhotoImage(file=str(ROOT / "assets" / "logo-24.png"))
         brand = ttk.Label(header, image=self.brand_image)
@@ -346,7 +347,7 @@ class App:
         self.settings_button.pack(side="right", padx=(4, 0))
         self.settings_button.bind("<Leave>", lambda e: self.settings_button.configure(
             bg=self.theme_color("#E6F2FB" if self.settings_visible else "#f7f8fa")), add="+")
-        tk.Checkbutton(header, text="问答", variable=self.qa_enabled, command=self.toggle_qa,
+        tk.Checkbutton(header, text="AI", variable=self.qa_enabled, command=self.toggle_qa,
                        indicatoron=False, selectcolor="#E6F2FB", relief="flat", padx=11, pady=5,
                        bg="#f7f8fa", activebackground="#f7f8fa", fg="#737b8c",
                        font=("Microsoft YaHei UI", 9), bd=0, highlightthickness=0).pack(side="right")
@@ -419,36 +420,30 @@ class App:
 
         self.body = ttk.Frame(frame)
         self.body.pack(fill="both", expand=True)
-        controls = ttk.Frame(self.body)
-        controls.pack(side="bottom", fill="x", pady=(10, 0))
-        self.start_button = button(controls, "开始转写", self.toggle_recording, primary=True)
-        self.start_button.pack(side="left")
+        controls = self.controls = ttk.Frame(header)
+        controls.pack(side="right", padx=(0, 6))
         self.more_button = button(controls, "···", self.open_menu)
         self.more_button.pack(side="right")
         self.footer = tk.StringVar(value="自动保存")
         self.storage_hint = tk.StringVar(value="自动保存")
         ttk.Label(controls, textvariable=self.storage_hint, font=("Microsoft YaHei UI", 8), foreground="#a0a6b2").pack(side="right", padx=8)
-        grip = ttk.Label(root, text="◢", cursor="size_nw_se", font=("Segoe UI", 8))
+        grip = self.resize_grip = ttk.Label(root, text="◢", cursor="size_nw_se", font=("Segoe UI", 8))
         grip.place(relx=1, rely=1, anchor="se")
         grip.bind("<ButtonPress-1>", self.resize_begin)
         grip.bind("<B1-Motion>", self.resize_move)
+        grip.bind("<ButtonRelease-1>", self.flush_resize)
 
         self.status = tk.StringVar(value="准备就绪")
         self.status_label = ttk.Label(self.body, textvariable=self.status, wraplength=510)
-        self.status_label.pack(anchor="w", pady=(0, 8))
         self.level = tk.Canvas(self.body, height=2, bg="#edf0f7", bd=0, highlightthickness=0)
         self.level_bar = self.level.create_rectangle(0, 0, 0, 2, fill="#007ACC", outline="")
-        self.level.pack(fill="x", pady=(0, 10))
         self.columns = tk.PanedWindow(self.body, orient="horizontal", bg="#f7f8fa",
-                                      bd=0, sashwidth=7, sashrelief="flat", showhandle=False)
+                                      bd=0, sashwidth=7, sashrelief="flat", showhandle=False,
+                                      opaqueresize=False, proxybackground="#007ACC",
+                                      proxyborderwidth=0, proxyrelief="flat")
         self.columns.pack(fill="both", expand=True)
         self.left_panel = tk.Frame(self.columns, bg="white", highlightbackground="#eceef3", highlightcolor="#eceef3", highlightthickness=1)
-        left_header = tk.Frame(self.left_panel, bg="white", padx=10, pady=3)
-        left_header.pack(fill="x")
-        tk.Label(left_header, text="转写", bg="white", fg="#737b8c", font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
-        self.copy_button = button(left_header, "复制全文", self.copy)
-        self.copy_button.configure(bg="white", font=("Microsoft YaHei UI", 8))
-        self.copy_button.pack(side="right")
+        self.copy_button = button(self.left_panel, "复制全文", self.copy)
         self.columns.add(self.left_panel, minsize=150, stretch="always")
         self.text = tk.Text(self.left_panel, wrap="word", font=("Microsoft YaHei UI", 10),
                             bg="white", fg="#263044", relief="flat", bd=0, highlightthickness=0,
@@ -460,27 +455,39 @@ class App:
         # The visible surface renders source-labelled selectable chat bubbles.
         self.chat = ChatView(self.left_panel, self.bubble_click, self.bubble_select_text)
         self.chat.pack(fill="both", expand=True)
+        self.copy_button.place(relx=1, x=-14, y=3, anchor="ne")
+        self.copy_button.lift()
+        self.start_button = button(self.left_panel, "开始转写", self.toggle_recording)
+        self.start_button.place(relx=1, rely=1, x=-14, y=-6, anchor="se")
+        self.start_button.lift()
         self.transcript_scrollbar = self.chat.scrollbar
         self.text.tag_configure("qa_selected", background="#E6F2FB", foreground="#007ACC")
         self.text.bind("<ButtonPress-1>", self.question_press)
         self.text.bind("<ButtonRelease-1>", self.question_release)
         self.qa_panel = tk.Frame(self.columns, bg="white", highlightbackground="#eceef3", highlightcolor="#eceef3", highlightthickness=1)
-        qa_header = tk.Frame(self.qa_panel, bg="white", padx=10, pady=3)
+        qa_header = self.qa_header = tk.Frame(self.qa_panel, bg="white", padx=10, pady=3)
         qa_header.pack(fill="x")
         tk.Label(qa_header, textvariable=self.qa_provider_name, bg="white", fg="#007ACC", font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
         self.answer_copy_button = button(qa_header, "复制", self.copy_answer)
         self.answer_copy_button.configure(bg="white", font=("Microsoft YaHei UI", 8))
         self.answer_copy_button.pack(side="right")
-        connection_bar = tk.Frame(self.qa_panel, bg="white", padx=10)
-        connection_bar.pack(fill="x")
-        self.codex_status_label = tk.Label(connection_bar, textvariable=self.codex_status,
+        self.codex_status_label = tk.Label(qa_header, textvariable=self.codex_status,
                                           bg="white", fg="#9297a4", font=("Microsoft YaHei UI", 8))
-        self.codex_status_label.pack(side="left")
-        self.qa_status_label = tk.Label(self.qa_panel, textvariable=self.qa_status, wraplength=230,
+        self.codex_status_label.pack(side="left", padx=(8, 0))
+        # Keep a drag surface when the normal title bar is hidden. Text widgets
+        # retain their selection behavior; copy/send buttons remain clickable.
+        for widget in (qa_header, self.chat.canvas, self.chat.inner,
+                       *(child for child in qa_header.winfo_children() if isinstance(child, tk.Label))):
+            widget.bind('<ButtonPress-1>', self.drag_begin, add='+')
+            widget.bind('<B1-Motion>', self.drag_move, add='+')
+        qa_header.configure(cursor='fleur')
+        qa_footer = tk.Frame(self.qa_panel, bg="white")
+        qa_footer.pack(side="bottom", fill="x", padx=10, pady=(2, 3))
+        self.ask_selected_button = button(qa_footer, "发送所选", self.ask_selected)
+        self.ask_selected_button.pack(side="right")
+        self.qa_status_label = tk.Label(qa_footer, textvariable=self.qa_status, width=1,
                                         bg="white", fg="#9297a4", font=("Microsoft YaHei UI", 8), anchor="w", justify="left")
-        self.qa_status_label.pack(side="bottom", fill="x", padx=10, pady=(0, 5))
-        self.ask_selected_button = button(self.qa_panel, "发送所选", self.ask_selected)
-        self.ask_selected_button.pack(side="bottom", anchor="e", padx=10, pady=(5, 3))
+        self.qa_status_label.pack(side="left", fill="x", expand=True)
         self.qa_text = tk.Text(self.qa_panel, wrap="word", bg="white", fg="#263044", relief="flat",
                               font=("Microsoft YaHei UI", 10), padx=14, pady=6, spacing1=2, spacing2=3, spacing3=10,
                               state="disabled", width=1, height=1)
@@ -490,7 +497,6 @@ class App:
         self.qa_placeholder = tk.Label(self.qa_text, text="选择文字，开始提问", bg="white", fg="#a0a5b1",
                                        font=("Microsoft YaHei UI", 9), justify="center")
         self.qa_placeholder.place(relx=0.5, rely=0.42, anchor="center")
-        self.qa_panel.bind("<Configure>", lambda e: self.qa_status_label.configure(wraplength=max(110, e.width-10)))
         self.qa_status.set("")
         self.menu = tk.Menu(root, tearoff=False, font=("Microsoft YaHei UI", 10))
         self.menu.add_command(label="导出 TXT / SRT", command=self.export)
@@ -512,6 +518,9 @@ class App:
         self.configure_qa_provider()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Configure>", self.on_resize)
+        self.focus_mode = False
+        root.bind('<F11>', self.toggle_focus_mode)
+        root.bind('<Escape>', self.exit_focus_mode)
         for widget in (root, self.text, self.qa_text):
             widget.bind("<Control-BackSpace>", self.clear_conversation)
         root.after(100, self.enable_taskbar)
@@ -521,6 +530,44 @@ class App:
 
     def theme_color(self, value):
         return theme.color(value, self.dark_mode.get())
+
+    def toggle_focus_mode(self, event=None):
+        if self.root.grab_current() is not None:
+            return
+        if self.focus_mode:
+            return self.exit_focus_mode()
+        self.clear_resize_preview()
+        self.root.update_idletasks()
+        self._normal_view = dict(geometry=self.root.geometry(),
+            topmost=self.root.attributes('-topmost'), qa=self.qa_enabled.get(),
+            sash=self.columns.sash_coord(0)[0] if len(self.columns.panes()) == 2 else None)
+        self.focus_mode = True
+        self.open_qa()
+        self.header.pack_forget()
+        self.status_label.pack_forget()
+        self.resize_grip.lift()
+        self.main_frame.configure(padding=0)
+        self.main_frame.pack_configure(padx=0, pady=0)
+        return 'break'
+
+    def exit_focus_mode(self, event=None):
+        if not self.focus_mode or self.root.grab_current() is not None:
+            return
+        self.focus_mode = False
+        view = self._normal_view
+        self.main_frame.configure(padding=(12, 8, 12, 12))
+        self.main_frame.pack_configure(padx=1, pady=1)
+        self.header.pack(fill='x', pady=(0, 8), before=self.body)
+        self.resize_grip.place(relx=1, rely=1, anchor='se')
+        if not view['qa']:
+            self.qa_enabled.set(False)
+            self.toggle_qa()
+        self.root.attributes('-topmost', view['topmost'])
+        # Keep any position/size chosen while focused when restoring chrome.
+        self.root.update_idletasks()
+        if view['sash'] is not None:
+            self.columns.sash_place(0, view['sash'], 0)
+        return 'break'
 
     def apply_theme(self):
         theme.apply(self.root, self.dark_mode.get())
@@ -601,13 +648,47 @@ class App:
 
     def resize_begin(self, event):
         self._resize_origin = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
+        self._pending_geometry = None
+        self.clear_resize_preview()
+        preview = self._resize_preview = tk.Toplevel(self.root)
+        preview.withdraw()
+        preview.overrideredirect(True)
+        preview.attributes('-disabled', True)
+        preview.attributes('-topmost', True)
+        preview.configure(bg='#ff00ff')
+        preview.attributes('-transparentcolor', '#ff00ff')
+        tk.Frame(preview, bg='#ff00ff', highlightbackground='#007ACC',
+                 highlightthickness=2, bd=0).pack(fill='both', expand=True)
+        preview.geometry(f'{self.root.winfo_width()}x{self.root.winfo_height()}'
+                         f'{self.root.winfo_rootx():+d}{self.root.winfo_rooty():+d}')
+        preview.deiconify()
+
+    def clear_resize_preview(self):
+        preview = getattr(self, '_resize_preview', None)
+        if preview is not None:
+            preview.destroy()
+            self._resize_preview = None
 
     def resize_move(self, event):
         x, y, width, height = self._resize_origin
-        self.root.geometry(f"{max(420, width + event.x_root - x)}x{max(280, height + event.y_root - y)}")
+        self._pending_geometry = f"{max(420, width + event.x_root - x)}x{max(280, height + event.y_root - y)}"
+        preview = getattr(self, '_resize_preview', None)
+        if preview is not None:
+            preview.geometry(self._pending_geometry +
+                             f'{self.root.winfo_rootx():+d}{self.root.winfo_rooty():+d}')
+
+    def flush_resize(self, event=None):
+        if event is not None and getattr(self, '_resize_preview', None) is not None:
+            self.resize_move(event)
+        self.clear_resize_preview()
+        geometry = getattr(self, '_pending_geometry', None)
+        if geometry:
+            self._pending_geometry = None
+            self.root.geometry(geometry)
 
     def on_resize(self, event):
-        if event.widget == self.root:
+        if event.widget == self.root and event.width != getattr(self, '_status_width', None):
+            self._status_width = event.width
             self.status_label.configure(wraplength=max(360, event.width - 34))
 
     def enable_taskbar(self, window=None):
@@ -897,11 +978,12 @@ class App:
             labels.update(authenticated="已配置 · 待验证", unauthenticated="未配置密钥")
         self.codex_status.set("● " + labels[state])
         self.codex_detail.set(self.codex_connection.detail)
-        self.codex_status_label.configure(fg=self.theme_color("#007ACC" if state == "verified" else
-                                          "#B65B39" if state in ("missing", "unauthenticated", "unavailable") else "#9297a4"))
+        status_color = {"verified": "#15803D", "checking": "#2563EB",
+                        "authenticated": "#B45309", "missing": "#B91C1C",
+                        "unauthenticated": "#B45309", "unavailable": "#B91C1C"}.get(state, "#9297a4")
+        self.codex_status_label._light_colors['foreground'] = status_color
+        self.codex_status_label.configure(fg=self.theme_color(status_color))
         self.codex_check_button.configure(state="disabled" if state == "checking" else "normal")
-        if not self.qa.active:
-            self.qa_status.set(self.codex_connection.detail)
 
     def balance_columns(self):
         if self.qa.enabled and len(self.columns.panes()) == 2:
@@ -1231,6 +1313,7 @@ class App:
     def close(self):
         if self.closing:
             return
+        self.clear_resize_preview()
         self.save_desktop_settings()
         if getattr(self, 'tray', None):
             self.tray.stop()

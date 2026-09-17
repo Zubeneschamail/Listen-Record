@@ -1,5 +1,6 @@
 """Image buttons with retained text labels and delayed hover/focus descriptions."""
 from pathlib import Path
+import math
 import tkinter as tk
 from PIL import Image, ImageTk
 
@@ -12,11 +13,18 @@ class IconButton(tk.Button):
         self.images = {name: tk.PhotoImage(master=parent, file=str(ICONS / f'{name}.png'))
                        for name in (icon, 'check')}
         original = Image.open(ICONS / f'{icon}.png').convert('RGBA')
+        if icon in ('microphone', 'waveform'):
+            self.active_source = Image.new('RGBA', original.size, '#D94A45')
+            self.active_source.putalpha(original.getchannel('A'))
+            self.images['active'] = ImageTk.PhotoImage(self.active_source, master=parent)
         muted = Image.new('RGBA', original.size, '#728299')
         muted.putalpha(original.getchannel('A'))
         self.disabled_image = ImageTk.PhotoImage(muted, master=parent)
         self.tooltip_window = None
         self.tooltip_timer = None
+        self.animation_timer = None
+        self.animation_frames = []
+        self.animation_frame = 0
         super().__init__(parent, **kwargs)
         super().configure(image=self.images[icon], compound='none', width=30, height=28, padx=0, pady=0,
                           disabledforeground='')
@@ -26,6 +34,7 @@ class IconButton(tk.Button):
         self.bind('<FocusOut>', self.hide_tooltip, add='+')
         self.bind('<ButtonPress-1>', self.hide_tooltip, add='+')
         self.bind('<Destroy>', self.hide_tooltip, add='+')
+        self.bind('<Destroy>', self.stop_animation, add='+')
 
     def configure(self, cnf=None, **kwargs):
         # Tk stipples the entire image rectangle when disabledforeground is set,
@@ -34,13 +43,42 @@ class IconButton(tk.Button):
             kwargs['disabledforeground'] = ''
         result = super().configure(cnf, **kwargs)
         if 'text' in kwargs or 'state' in kwargs:
+            name = ('active' if self.icon_name in ('microphone', 'waveform') and self.cget('text') == '停止转写'
+                    else 'check' if self.cget('text') == '已复制' else self.icon_name)
             image = (self.disabled_image if str(self.cget('state')) == 'disabled' else
-                     self.images['check' if self.cget('text') == '已复制' else self.icon_name])
+                     self.images[name])
             super().configure(image=image)
+            if name == 'active' and str(self.cget('state')) != 'disabled':
+                if self.animation_timer is None:
+                    self.animate_recording()
+            else:
+                self.stop_animation()
             self.hide_tooltip()
         return result
 
     config = configure
+
+    def animate_recording(self):
+        if not self.animation_frames:
+            source = self.active_source
+            for i in range(36):
+                phase = 2 * math.pi * i / 36
+                opacity = .9 + .1 * math.cos(phase)
+                frame = source.copy()
+                frame.putalpha(source.getchannel('A').point(lambda alpha: round(alpha * opacity)))
+                self.animation_frames.append(ImageTk.PhotoImage(frame, master=self))
+        # Change only opacity; all frames retain identical size and position.
+        super().configure(image=self.animation_frames[self.animation_frame])
+        self.animation_frame = (self.animation_frame + 1) % len(self.animation_frames)
+        self.animation_timer = self.winfo_toplevel().after(50, self.animate_recording)
+
+    def stop_animation(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        if self.animation_timer is not None:
+            self.winfo_toplevel().after_cancel(self.animation_timer)
+            self.animation_timer = None
+        self.animation_frame = 0
 
     def schedule_tooltip(self, event=None):
         self.hide_tooltip()
