@@ -2,8 +2,9 @@
 
 ## 安装与启动
 
-1. 在 Windows 电脑上安装 Python 3.12，双击 `setup.cmd` 安装依赖并下载模型。
-2. 安装完成后，双击 `start.cmd` 启动。以后直接运行 `start.cmd` 即可。
+1. 下载项目 ZIP 后，右键选择「全部解压缩」。不要直接在压缩包内运行脚本，也不要只取出单个脚本。
+2. 在 Windows 电脑上安装 Python 3.12，进入解压后的项目文件夹，确认 `setup.cmd`、`requirements.txt` 和 `app.py` 在同一目录，再双击 `setup.cmd` 安装依赖并下载模型。
+3. 安装完成后，双击 `start.cmd` 启动。以后直接运行 `start.cmd` 即可。
 
 ## 声音转写
 
