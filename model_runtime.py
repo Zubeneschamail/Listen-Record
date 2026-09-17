@@ -16,6 +16,7 @@ def prepare_cuda():
     if os.name == 'nt' and not _DLL_HANDLES:
         directories = list((Path(sys.prefix) / 'Lib/site-packages/nvidia').glob('*/bin'))
         directories += list((RESOURCES / 'nvidia').glob('*/bin'))
+        directories += list((RESOURCES / 'gpu-runtime/nvidia').glob('*/bin'))
         for directory in directories:
             _DLL_HANDLES.append(os.add_dll_directory(str(directory)))
             # CTranslate2 uses native LoadLibrary, which also needs the process PATH.

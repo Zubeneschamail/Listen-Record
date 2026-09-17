@@ -18,24 +18,24 @@ SetupIconFile=..\assets\wenlu.ico
 UninstallDisplayIcon={app}\Wenlu.exe
 Compression=lzma2/fast
 SolidCompression=yes
+ArchiveExtraction=full
 WizardStyle=modern
 CloseApplications=no
 RestartApplications=no
 DisableProgramGroupPage=yes
 [Types]
 Name: "standard"; Description: "标准安装（CPU 转录）"
-Name: "full"; Description: "完整安装（含 NVIDIA GPU 加速）"
+Name: "full"; Description: "GPU 加速安装（需联网下载组件）"
 Name: "custom"; Description: "自定义安装"; Flags: iscustom
 [Components]
 Name: "core"; Description: "闻录与内置转录模型（必需）"; Types: standard full custom; Flags: fixed
-Name: "gpu"; Description: "GPU 加速组件（NVIDIA 显卡，CUDA 12 / cuDNN 9）"; Types: full
+Name: "gpu"; Description: "GPU 加速组件（NVIDIA 显卡，需联网下载约 1.0 GB）"; Types: full
 [Files]
-Source: "..\dist\Wenlu\*"; DestDir: "{app}"; Excludes: "_internal\nvidia\*"; Components: core; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\build\gpu-runtime\nvidia\*"; DestDir: "{app}\_internal\nvidia"; Components: gpu; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\build\gpu-runtime\licenses\*"; DestDir: "{app}\_internal\assets\licenses\nvidia"; Components: gpu; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\build\gpu-runtime\manifest.json"; DestDir: "{app}\_internal\nvidia"; Components: gpu; Flags: ignoreversion
+Source: "..\dist\Wenlu\*"; DestDir: "{app}"; Excludes: "_internal\nvidia\*,_internal\gpu-runtime\*"; Components: core; Flags: ignoreversion recursesubdirs createallsubdirs
+#include "gpu-components.iss"
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal\nvidia"; Check: not WizardIsComponentSelected('gpu')
+Type: filesandordirs; Name: "{app}\_internal\gpu-runtime"; Check: not WizardIsComponentSelected('gpu')
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; Flags: checkedonce
 [Icons]
