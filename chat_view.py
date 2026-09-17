@@ -2,6 +2,7 @@
 import tkinter as tk
 import tkinter.font as tkfont
 from scrollbars import SlimScrollbar
+from theme import color
 
 SURFACE = "#ffffff"
 
@@ -32,6 +33,18 @@ class Bubble(tk.Frame):
         self.draft = row.get("draft", False)
         if self.draft:
             self.text.configure(fg="#8A929C" if self.mine else "#7896AD")
+        self.dark = getattr(self.winfo_toplevel(), '_dark_theme', False)
+        self.apply_theme(self.dark)
+
+    def apply_theme(self, dark):
+        self.dark = dark
+        surface = color(SURFACE, dark)
+        self.normal = color('#F0F1F3' if self.mine else '#EDF4FA', dark)
+        self.configure(bg=surface)
+        self.canvas.configure(bg=surface)
+        self.label.configure(bg=surface, fg=color('#a3adba', dark))
+        self.text.configure(selectbackground=color('#E0E4E9' if self.mine else '#DCECF8', dark))
+        self.layout_key = None
 
     def press(self, event):
         self.origin = (event.x, event.y)
@@ -79,7 +92,7 @@ class Bubble(tk.Frame):
         self.canvas.coords(self.text_id, 12 if self.mine else 17, 8)
         self.canvas.itemconfigure(self.text_id, width=content, height=height)
         self.canvas.delete("shape")
-        fill = ("#E0E4E9" if self.mine else "#DCECF8") if self.selected else self.normal
+        fill = color("#E0E4E9" if self.mine else "#DCECF8", self.dark) if self.selected else self.normal
         w, h, r = bubble_width, bubble_height, 6
 
         def rounded(inset, radius, color):
@@ -104,6 +117,7 @@ class Bubble(tk.Frame):
                                    fill=fill, outline="", tags="shape")
         self.canvas.tag_lower("shape")
         foreground = ("#8A929C" if self.mine else "#7896AD") if self.draft else "#263044"
+        foreground = color(foreground, self.dark)
         self.text.configure(bg=fill, fg=foreground, selectforeground=foreground)
         self.configure(height=bubble_height+32)
 
@@ -115,6 +129,7 @@ class Bubble(tk.Frame):
 
 
 class ChatView(tk.Frame):
+    _custom_theme = True
     def __init__(self, parent, click, selected_text):
         super().__init__(parent, bg=SURFACE)
         self.click, self.selected_text = click, selected_text
@@ -129,6 +144,16 @@ class ChatView(tk.Frame):
         self.inner.bind("<Configure>", self.update_scroll_region)
         self.canvas.bind("<MouseWheel>", self.wheel)
         self.pending_follow = None
+        self.pending_layout = None
+
+    def apply_theme(self, dark):
+        surface = color(SURFACE, dark)
+        for widget in (self, self.canvas, self.inner):
+            widget.configure(bg=surface)
+        self.scrollbar.apply_theme(dark)
+        for bubble in self.bubbles.values():
+            bubble.apply_theme(dark)
+        self.resize()
 
     def update_scroll_region(self, event=None):
         if not self.bubbles:
@@ -141,10 +166,23 @@ class ChatView(tk.Frame):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def resize(self, event=None):
+        follow = self.canvas.yview()[1] >= .995
         width = max(120, self.canvas.winfo_width()-14)
         self.canvas.itemconfigure(self.inner_id, width=width)
         for bubble in self.bubbles.values():
             bubble.layout(width)
+        if self.pending_layout:
+            self.winfo_toplevel().after_cancel(self.pending_layout)
+        self.pending_layout = self.winfo_toplevel().after_idle(lambda: self.finish_layout(follow))
+
+    def finish_layout(self, follow):
+        self.pending_layout = None
+        # Wrapping changes the embedded frame's requested height. Its Configure
+        # event may not arrive while an old scroll offset has unmapped it.
+        self.update_idletasks()
+        self.update_scroll_region()
+        if follow:
+            self.canvas.yview_moveto(1)
 
     def wheel(self, event):
         self.canvas.yview_scroll((-1 if event.delta > 0 else 1)*max(1, abs(event.delta)//40), "units")
@@ -197,6 +235,9 @@ class ChatView(tk.Frame):
             self.update_scroll_region()
 
     def clear(self):
+        if self.pending_layout:
+            self.winfo_toplevel().after_cancel(self.pending_layout)
+            self.pending_layout = None
         if self.pending_follow:
             self.winfo_toplevel().after_cancel(self.pending_follow)
             self.pending_follow = None

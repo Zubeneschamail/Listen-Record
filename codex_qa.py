@@ -53,6 +53,7 @@ class CodexQA:
     def __init__(self, events, runner=None, clock=time.monotonic):
         self.events = events
         self.runner = runner or self._run
+        self.stream_runner = None
         self.clock = clock
         self.enabled = False
         self.generation = 0
@@ -117,10 +118,14 @@ class CodexQA:
         generation, cancel = self.generation, self.cancel
         self.events.put(("qa", (generation, "thinking", question)))
         prompt = make_prompt("\n".join(self.context)[-5000:], question)
+        runner, stream_runner = self.runner, self.stream_runner
 
         def work():
             try:
-                answer = self.runner(prompt, cancel)
+                def partial(text):
+                    if not cancel.is_set():
+                        self.events.put(("qa", (generation, "partial", (question, text))))
+                answer = stream_runner(prompt, cancel, partial) if stream_runner else runner(prompt, cancel)
                 if not cancel.is_set():
                     self.events.put(("qa", (generation, "answer", (question, answer))))
             except Exception as exc:
@@ -130,13 +135,13 @@ class CodexQA:
                 self.events.put(("qa", (generation, "done", None)))
         threading.Thread(target=work, daemon=True, name="codex-qa").start()
 
-    def _run(self, prompt, cancel):
+    def _run(self, prompt, cancel, timeout=120):
         with tempfile.TemporaryDirectory(prefix="wenlu-qa-") as directory:
             process = subprocess.Popen(command(find_codex(), directory), stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        encoding="utf-8", errors="replace", text=True,
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            deadline = time.monotonic() + 120
+            deadline = time.monotonic() + timeout
             first = True
             try:
                 while True:

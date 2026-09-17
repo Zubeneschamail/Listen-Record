@@ -10,6 +10,158 @@ from app import App
 
 
 class WindowFlowTests(unittest.TestCase):
+    def test_restore_long_conversation_reflows_scroll_region(self):
+        with patch('app.GlobalHotkey'):
+            root = tk.Tk()
+            app = App(root)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / 'history.jsonl'
+                rows = [dict(start=i, end=i+1, text='恢复长对话后仍能看到完整文字。' * 3) for i in range(100)]
+                path.write_text('\n'.join(json.dumps(row) for row in rows), encoding='utf-8')
+                app.restore_session(path)
+                app.open_qa()
+                root.geometry('700x500')
+                root.update()
+                root.update_idletasks()
+                region = [float(n) for n in app.chat.canvas.cget('scrollregion').split()]
+                self.assertEqual(region[-1], app.chat.canvas.bbox('all')[-1])
+                self.assertTrue(app.chat.inner.winfo_ismapped())
+        finally:
+            app.codex_connection.close()
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call('after', 'info'):
+                root.after_cancel(identifier)
+            root.destroy()
+
+    def test_dark_theme_is_reversible_and_new_bubbles_inherit_it(self):
+        with patch('app.GlobalHotkey'):
+            root = tk.Tk()
+            app = App(root)
+        root.withdraw()
+        try:
+            app.chat.add(0, dict(id=0, text='已有对话', source='system'))
+            bubble = app.chat.bubbles[0]
+            bubble.set_selected(True)
+            app.dark_mode.set(True)
+            app.change_theme()
+            self.assertEqual(app.qa_text.cget('bg'), '#1C2430')
+            self.assertEqual(bubble.text.cget('fg'), '#E3EAF4')
+            self.assertTrue(bubble.selected)
+            self.assertEqual(bubble.text.cget('bg'), '#315B7C')
+            app.chat.draft('microphone', '新临时文字')
+            draft = app.chat.bubbles['draft:microphone']
+            self.assertEqual(draft.text.cget('bg'), '#303A48')
+            app.chat.finalize('microphone', dict(id=1, text='修正文字', source='microphone'))
+            self.assertIs(app.chat.bubbles[1], draft)
+            self.assertEqual(draft.text.cget('fg'), '#E3EAF4')
+            app.dark_mode.set(False)
+            app.change_theme()
+            self.assertEqual(app.qa_text.cget('bg'), 'white')
+            self.assertEqual(bubble.text.cget('fg'), '#263044')
+            self.assertEqual(bubble.text.get('1.0', 'end-1c'), '已有对话')
+            self.assertEqual(draft.text.cget('bg'), '#F0F1F3')
+        finally:
+            app.codex_connection.close()
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call('after', 'info'):
+                root.after_cancel(identifier)
+            root.destroy()
+
+    def setUp(self):
+        tray = patch('app.App.start_tray', return_value=True)
+        tray.start()
+        self.addCleanup(tray.stop)
+        config = patch('app.load_settings', return_value={'provider': 'codex', 'profiles': {}})
+        config.start()
+        self.addCleanup(config.stop)
+        preflight = patch('codex_connection.CodexConnection.check',
+                          lambda connection, probe=False: connection._publish(
+                              connection.revision, 'authenticated', 'Test login ready'))
+        preflight.start()
+        self.addCleanup(preflight.stop)
+        save = patch('app.save_desktop')
+        save.start()
+        self.addCleanup(save.stop)
+
+    def test_model_manager_shows_byte_progress_and_unified_selection(self):
+        from tkinter import ttk
+        from unittest.mock import Mock
+        with patch('app.GlobalHotkey'):
+            root = tk.Tk()
+            app = App(root)
+        root.withdraw()
+        receiver, sender, process, context = Mock(), Mock(), Mock(), Mock()
+        messages = [('bytes', (1024**3, 2*1024**3))]
+        receiver.poll.side_effect = lambda: bool(messages)
+        receiver.recv.side_effect = lambda: messages.pop(0)
+        context.Pipe.return_value = (receiver, sender)
+        context.Process.return_value = process
+        process.is_alive.return_value = True
+        try:
+            with patch('model_download.cached_model', return_value=None), \
+                 patch('multiprocessing.get_context', return_value=context):
+                app.model_manage_button.invoke()
+                window = app._model_window
+                widgets = window.winfo_children()
+                action = next(w for w in widgets if isinstance(w, tk.Button))
+                progress = next(w for w in widgets if isinstance(w, ttk.Progressbar))
+                action.invoke()
+                root.after(250, root.quit)
+                root.mainloop()
+                self.assertEqual(str(progress['mode']), 'determinate')
+                self.assertAlmostEqual(float(progress['value']) / float(progress['maximum']), 0.5)
+                self.assertEqual(action['text'], '取消下载')
+                self.assertFalse(app.model.winfo_ismapped())
+                action.invoke()
+                process.terminate.assert_called_once()
+                self.assertFalse(progress.winfo_ismapped())
+        finally:
+            app.codex_connection.close()
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call('after', 'info'):
+                root.after_cancel(identifier)
+            root.destroy()
+
+    def test_provider_switch_resets_answer_and_rejects_stale_stream(self):
+        with patch('app.GlobalHotkey'):
+            root = tk.Tk()
+            app = App(root)
+        root.withdraw()
+        try:
+            app.open_qa()
+            old_generation, cancel = app.qa.generation, app.qa.cancel
+            app.qa_cache['previous'] = 'old answer'
+            app.qa_settings = {'provider': 'deepseek', 'profiles': {}}
+            app.configure_qa_provider()
+            self.assertTrue(cancel.is_set())
+            self.assertEqual(app.qa_cache, {})
+            self.assertEqual(app.qa_provider_name.get(), 'DeepSeek')
+            self.assertIsNotNone(app.qa.stream_runner)
+            self.assertEqual(app.codex_connection.login()[0], 'unauthenticated')
+            app.handle_qa((old_generation, 'partial', ('old question', 'stale')))
+            self.assertEqual(app.qa_answer, '')
+            app.handle_qa((app.qa.generation, 'partial', ('question', 'partial')))
+            self.assertEqual(app.qa_answer, 'partial')
+            self.assertEqual(app.qa_history, [])
+            self.assertEqual(app.qa_cache, {})
+            app.handle_qa((app.qa.generation, 'answer', ('question', 'partial final')))
+            self.assertEqual(app.qa_text.get('1.0', 'end-1c'), 'question\npartial final')
+            app.qa_settings['provider'] = 'codex'
+            app.configure_qa_provider()
+            self.assertIsNone(app.qa.stream_runner)
+            self.assertEqual(app.qa_answer, '')
+        finally:
+            app.codex_connection.close()
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call('after', 'info'):
+                root.after_cancel(identifier)
+            root.destroy()
+
     def test_two_speaker_drafts_finalize_in_place_and_restore_sources(self):
         from unittest.mock import Mock
         with patch("app.GlobalHotkey"):
@@ -62,6 +214,13 @@ class WindowFlowTests(unittest.TestCase):
             self.assertEqual(root.geometry(), geometry)
             self.assertTrue(app.settings_window.winfo_viewable())
             self.assertEqual(root.grab_current(), app.settings_window)
+            with patch.object(app.codex_connection, 'check') as check:
+                app.codex_check_button.invoke()
+                check.assert_called_once_with(probe=True)
+            app.codex_connection.record()
+            app.poll()
+            self.assertIn('响应正常', app.codex_status.get())
+            self.assertTrue(app.codex_check_button.winfo_viewable())
             app.model.current(1)
             app.hotwords.set("大模型,闻录")
             app.hide_settings()

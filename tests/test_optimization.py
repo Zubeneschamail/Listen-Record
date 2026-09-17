@@ -7,11 +7,24 @@ from segmentation import PauseSegmenter, RATE
 from tests.test_segmentation import detector, feed
 
 class OptimizationTests(unittest.TestCase):
+    def test_missing_cuda_runtime_never_initializes_gpu_model(self):
+        cpu = Mock()
+        cpu.transcribe.return_value = (iter([]), None)
+        status = Mock()
+        with patch('model_download.cached_model', return_value='cached'), patch('model_runtime.prepare_cuda'), \
+             patch('model_runtime.cuda_runtime_available', return_value=False), \
+             patch('model_runtime.ctranslate2.get_cuda_device_count', return_value=1), \
+             patch('model_runtime.WhisperModel', return_value=cpu) as create:
+            self.assertIs(load_model('small', status=status), cpu)
+            create.assert_called_once()
+            self.assertEqual(create.call_args.kwargs['device'], 'cpu')
+            self.assertEqual(status.call_count, 2)
+
     def test_gpu_warmup_failure_falls_back_before_capture(self):
         gpu, cpu = Mock(), Mock()
         gpu.transcribe.side_effect = RuntimeError('missing DLL')
         cpu.transcribe.return_value = (iter([]), None)
-        with patch('model_runtime.prepare_cuda'), patch('model_runtime.ctranslate2.get_cuda_device_count', return_value=1), patch('model_runtime.WhisperModel', side_effect=[gpu, cpu]) as create:
+        with patch('model_download.cached_model', return_value='cached'), patch('model_runtime.prepare_cuda'), patch('model_runtime.cuda_runtime_available', return_value=True), patch('model_runtime.ctranslate2.get_cuda_device_count', return_value=1), patch('model_runtime.WhisperModel', side_effect=[gpu, cpu]) as create:
             self.assertIs(load_model('small'), cpu)
             self.assertEqual([c.kwargs['device'] for c in create.call_args_list], ['cuda', 'cpu'])
             cpu.transcribe.assert_called_once()

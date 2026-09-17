@@ -1,6 +1,7 @@
 """Image buttons with retained text labels and delayed hover/focus descriptions."""
 from pathlib import Path
 import tkinter as tk
+from PIL import Image, ImageTk
 
 ICONS = Path(__file__).resolve().parent / 'assets' / 'icons'
 
@@ -10,10 +11,15 @@ class IconButton(tk.Button):
         self.icon_name = icon
         self.images = {name: tk.PhotoImage(master=parent, file=str(ICONS / f'{name}.png'))
                        for name in (icon, 'check')}
+        original = Image.open(ICONS / f'{icon}.png').convert('RGBA')
+        muted = Image.new('RGBA', original.size, '#728299')
+        muted.putalpha(original.getchannel('A'))
+        self.disabled_image = ImageTk.PhotoImage(muted, master=parent)
         self.tooltip_window = None
         self.tooltip_timer = None
         super().__init__(parent, **kwargs)
-        super().configure(image=self.images[icon], compound='none', width=30, height=28, padx=0, pady=0)
+        super().configure(image=self.images[icon], compound='none', width=30, height=28, padx=0, pady=0,
+                          disabledforeground='')
         self.bind('<Enter>', self.schedule_tooltip, add='+')
         self.bind('<FocusIn>', self.schedule_tooltip, add='+')
         self.bind('<Leave>', self.hide_tooltip, add='+')
@@ -22,9 +28,15 @@ class IconButton(tk.Button):
         self.bind('<Destroy>', self.hide_tooltip, add='+')
 
     def configure(self, cnf=None, **kwargs):
+        # Tk stipples the entire image rectangle when disabledforeground is set,
+        # including transparent pixels. Render our own muted icon instead.
+        if 'disabledforeground' in kwargs:
+            kwargs['disabledforeground'] = ''
         result = super().configure(cnf, **kwargs)
-        if 'text' in kwargs:
-            super().configure(image=self.images['check' if kwargs['text'] == '已复制' else self.icon_name])
+        if 'text' in kwargs or 'state' in kwargs:
+            image = (self.disabled_image if str(self.cget('state')) == 'disabled' else
+                     self.images['check' if self.cget('text') == '已复制' else self.icon_name])
+            super().configure(image=image)
             self.hide_tooltip()
         return result
 

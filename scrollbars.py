@@ -1,11 +1,14 @@
 """Small overlay scrollbar: rounded thumb, no arrows and no layout reflow."""
 import tkinter as tk
+from theme import color
 
 
 class SlimScrollbar(tk.Canvas):
+    _custom_theme = True
     def __init__(self, text):
         super().__init__(text, width=12, bg="white", bd=0, highlightthickness=0, cursor="arrow")
         self.target = text
+        self.dark = getattr(self.winfo_toplevel(), '_dark_theme', False)
         self.first, self.last = 0.0, 1.0
         self.hover = self.dragging = False
         self.track = self.create_line(6, 10, 6, 30, width=2, capstyle=tk.ROUND,
@@ -42,10 +45,15 @@ class SlimScrollbar(tk.Canvas):
         active = self.hover or self.dragging
         radius = 3 if active else 2
         self.coords(self.track, 6, 10, 6, max(10, self.winfo_height()-10))
-        self.itemconfigure(self.track, state="normal" if active else "hidden")
+        self.itemconfigure(self.track, state="normal" if active else "hidden", fill=color('#f1f5f9', self.dark))
         self.coords(self.thumb, 6, top+radius, 6, max(top+radius, top+size-radius))
         self.itemconfigure(self.thumb, width=radius*2,
-                           fill="#007ACC" if self.dragging else "#9dc3df" if self.hover else "#dce3eb")
+                           fill=color("#007ACC" if self.dragging else "#9dc3df" if self.hover else "#dce3eb", self.dark))
+
+    def apply_theme(self, dark):
+        self.dark = dark
+        self.configure(bg=self.target.cget('background'))
+        self.draw()
 
     def set_hover(self, hover):
         self.hover = hover

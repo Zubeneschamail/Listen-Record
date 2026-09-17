@@ -1,0 +1,30 @@
+name: Windows installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m venv .venv
+      - run: .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+      - run: choco install innosetup --yes --no-progress
+      - shell: pwsh
+        run: ./packaging/build.ps1 -ISCC 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+      - name: Sign update metadata
+        shell: pwsh
+        env:
+          WENLU_UPDATE_PRIVATE_KEY: ${{ secrets.WENLU_UPDATE_PRIVATE_KEY }}
+        run: |
+          if (!$env:WENLU_UPDATE_PRIVATE_KEY) { throw 'Configure the release signing secret first' }
+          $installer = (Get-ChildItem release/Wenlu-Setup-*.exe | Select-Object -First 1).FullName
+          .\.venv\Scripts\python.exe packaging/sign_release.py $installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Wenlu-windows
+          path: release/*

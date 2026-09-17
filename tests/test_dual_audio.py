@@ -18,7 +18,7 @@ class DualAudioTests(unittest.TestCase):
             def __init__(self, index, callback):
                 self.index, self.callback, self.closed = index, callback, False
             def start_stream(self):
-                self.callback(np.full(1600, self.index, dtype=np.float32).tobytes(), 1600, {}, 0)
+                self.callback(np.full(1600, self.index / 10, dtype=np.float32).tobytes(), 1600, {}, 0)
                 if self.index == 2:
                     engine.stop()
             def close(self):
@@ -47,7 +47,7 @@ class DualAudioTests(unittest.TestCase):
             contexts.append(guidance)
             self.assertFalse(guidance.history)
             guidance.history.append('独立上下文')
-            return [(chunk.start, chunk.start+.1, '我说话' if chunk.audio[0] == 2 else '电脑播放', chunk.epoch)]
+            return [(chunk.start, chunk.start+.1, '我说话' if chunk.audio[0] > .15 else '电脑播放', chunk.epoch)]
 
         api = API()
         with patch('app.pa.PyAudio', return_value=api), patch('app.PauseSegmenter', Segmenter), \

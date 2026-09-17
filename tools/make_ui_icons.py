@@ -1,5 +1,6 @@
 """Generate compact pixel-sized line icons; development-only Pillow dependency."""
 from pathlib import Path
+import math
 from PIL import Image, ImageDraw
 
 folder = Path(__file__).resolve().parents[1] / 'assets' / 'icons'
@@ -25,8 +26,14 @@ for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check'
         for x in (4,10,16):
             d.ellipse(((x-1)*scale,9*scale,(x+1)*scale,11*scale),fill=color)
     elif name == 'refresh':
-        d.arc((3*scale,3*scale,17*scale,17*scale),start=35,end=315,fill=color,width=round(1.5*scale))
-        line([(12,5),(17,5),(17,0.8)])
+        # Two clockwise arrows: arrow tips meet the arc endpoints exactly.
+        # Keep both heads inside the same optical bounds as the other icons.
+        for start, end in ((220, 360), (40, 180)):
+            line([(10 + 6 * math.cos(math.radians(start + (end-start)*i/60)),
+                   10 + 6 * math.sin(math.radians(start + (end-start)*i/60)))
+                  for i in range(61)])
+        line([(13.5, 7.5), (16, 10), (18.5, 7.5)])
+        line([(1.5, 12.5), (4, 10), (6.5, 12.5)])
     elif name == 'close':
         line([(5,5),(15,15)])
         line([(15,5),(5,15)])
