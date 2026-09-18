@@ -1264,6 +1264,8 @@ class App:
     def render_qa(self, streaming=False):
         editor = getattr(self, 'question_editor', None)
         editor_focused = editor is not None and self.root.focus_get() is editor
+        # Capture the old viewport before header/layout or content changes.
+        follow = editor is None and self.qa_text.yview()[1] >= 1.0 - 1e-6
         has_answer = bool(self.qa_answer or self.qa_display_history)
         self.answer_copy_button.configure(state="normal" if has_answer else "disabled")
         if has_answer:
@@ -1284,7 +1286,6 @@ class App:
             self.question_editor = editor = None
             editor_focused = False
             self.ask_selected_button.configure(text='发送所选')
-        follow = editor is None and self.qa_text.yview()[1] >= 1.0 - 1e-6
         # Preserve the visible text line, not a percentage of a growing document.
         # A fixed fraction moves the viewport down as new answers are appended.
         top_line = self.qa_text.index('@0,0')
@@ -1306,7 +1307,14 @@ class App:
                     self.qa_text.insert("end", question + "\n", ("question", f"question_turn:{index}"))
                 self.qa_text.insert("end", answer)
         if follow:
+            # Wrapped/tagged text may still have pending geometry calculations.
+            # Like the transcript panel, settle layout then move to the actual
+            # bottom, rather than merely making the last index visible.
+            self.qa_text.update_idletasks()
             self.qa_text.see('end')
+            # Tk computes wrapped line heights lazily as they enter view.
+            self.qa_text.update_idletasks()
+            self.qa_text.yview_moveto(1)
         else:
             self.qa_text.yview(top_line)
         self.qa_text.configure(state="disabled")

@@ -21,6 +21,19 @@ class AnswerScrollTests(unittest.TestCase):
             root.update()
             self.assertAlmostEqual(text.yview()[1], 1.0)
 
+            # Several streamed chunks can arrive in one poll before Tk redraws;
+            # long wrapped paragraphs and spacing must not break bottom follow.
+            text.configure(spacing1=2, spacing2=5, spacing3=12, padx=16, pady=10)
+            root.update()
+            text.yview_moveto(1)
+            root.update()
+            self.assertAlmostEqual(text.yview()[1], 1.0)
+            for _ in range(5):
+                app.qa_answer += '连续生成的长段落需要自动换行并保持底部可见。' * 20
+                App.render_qa(app, streaming=True)
+            root.update()
+            self.assertAlmostEqual(text.yview()[1], 1.0)
+
             text.yview('40.0')
             root.update()
             anchor = text.index('@0,0')
