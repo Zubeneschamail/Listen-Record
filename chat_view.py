@@ -139,7 +139,7 @@ class Bubble(tk.Frame):
 
 class ChatView(tk.Frame):
     _custom_theme = True
-    def __init__(self, parent, click, selected_text):
+    def __init__(self, parent, click, selected_text, overlay_parent=None):
         super().__init__(parent, bg=SURFACE)
         self.click, self.selected_text = click, selected_text
         self.bubbles = {}
@@ -147,7 +147,7 @@ class ChatView(tk.Frame):
         self.canvas.pack(fill="both", expand=True)
         self.inner = tk.Frame(self.canvas, bg=SURFACE)
         self.inner_id = self.canvas.create_window(0, 0, anchor="nw", window=self.inner)
-        self.scrollbar = SlimScrollbar(self.canvas)
+        self.scrollbar = SlimScrollbar(self.canvas, overlay_parent=overlay_parent)
         self.scrollbar.configure(bg=SURFACE)
         self.canvas.bind("<Configure>", self.resize)
         self.inner.bind("<Configure>", self.update_scroll_region)
@@ -176,7 +176,7 @@ class ChatView(tk.Frame):
 
     def resize(self, event=None):
         follow = self.canvas.yview()[1] >= .995
-        width = max(120, self.canvas.winfo_width()-14)
+        width = max(120, self.canvas.winfo_width()-14-self.scrollbar.inset)
         self.canvas.itemconfigure(self.inner_id, width=width)
         for bubble in self.bubbles.values():
             bubble.layout(width)

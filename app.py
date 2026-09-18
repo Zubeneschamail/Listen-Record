@@ -413,7 +413,8 @@ class App:
         self.text.tag_configure("draft", foreground="#668EAB")
         # Indexed document backs excerpt selection and legacy saved transcripts.
         # The visible surface renders source-labelled selectable chat bubbles.
-        self.chat = ChatView(self.left_panel, self.bubble_click, self.bubble_select_text)
+        self.chat = ChatView(self.left_panel, self.bubble_click, self.bubble_select_text,
+                             overlay_parent=self.columns)
         self.chat.pack(fill="both", expand=True)
         self.copy_button.place(relx=1, x=-14, y=3, anchor="ne")
         self.copy_button.lift()
@@ -462,7 +463,7 @@ class App:
         self.qa_text.tag_configure("question", foreground="#007ACC", spacing1=8, spacing3=10)
         self.qa_text.tag_bind("question", "<Button-1>", self.edit_question)
         self.qa_text.pack(fill="both", expand=True)
-        self.answer_scrollbar = SlimScrollbar(self.qa_text)
+        self.answer_scrollbar = SlimScrollbar(self.qa_text, overlay_parent=self.columns)
         self.qa_placeholder = tk.Label(self.qa_text, text="选择文字，开始提问", bg="white", fg="#a0a5b1",
                                        font=(typography.UI_FAMILY, 9), justify="center")
         self.qa_placeholder.place(relx=0.5, rely=0.42, anchor="center")

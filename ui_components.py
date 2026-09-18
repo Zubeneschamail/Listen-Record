@@ -180,6 +180,11 @@ class SplitterHandle(tk.Canvas):
             return
         self.place(x=self.panes.sash_coord(0)[0]-6, y=0, width=13, relheight=1, bordermode='ignore')
         tk.Misc.lift(self)
+        # Scrollbars share this parent so their entire hit area can stay above
+        # the wider sash overlay, including after a resize or pane movement.
+        for widget in self.panes.winfo_children():
+            if getattr(widget, '_scrollbar_overlay', False) and widget.winfo_manager():
+                tk.Misc.lift(widget)
 
     def begin(self, event):
         self.drag = (self.panes.sash_coord(0)[0], event.x_root)

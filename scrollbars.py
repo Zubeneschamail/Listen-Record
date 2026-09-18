@@ -4,10 +4,14 @@ import tkinter as tk
 
 class SlimScrollbar(tk.Canvas):
     _custom_theme = True
-    def __init__(self, text):
-        super().__init__(text, width=14, bg=text.cget('background'), bd=0,
+    _scrollbar_overlay = True
+
+    def __init__(self, text, inset=0, overlay_parent=None):
+        super().__init__(overlay_parent if overlay_parent is not None else text,
+                         width=14, bg=text.cget('background'), bd=0,
                          highlightthickness=0, cursor="arrow")
         self.target = text
+        self.inset = inset
         self.dark = getattr(self.winfo_toplevel(), '_dark_theme', False)
         self.first, self.last = 0.0, 1.0
         self.hover = self.dragging = False
@@ -26,7 +30,7 @@ class SlimScrollbar(tk.Canvas):
         if self.last - self.first >= 0.999:
             self.place_forget()
         else:
-            self.place(relx=1, x=0, y=0, anchor="ne", width=14, relheight=1, bordermode="ignore")
+            self.place(in_=self.target, relx=1, x=-self.inset, y=0, anchor="ne", width=14, relheight=1, bordermode="ignore")
             tk.Misc.lift(self)
             self.draw()
 
