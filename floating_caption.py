@@ -1,5 +1,6 @@
 """Transparent, draggable, always-on-top captions for Windows."""
 import tkinter as tk
+import typography
 from tkinter import font as tkfont
 from difflib import SequenceMatcher
 
@@ -61,7 +62,7 @@ class FloatingCaption(tk.Toplevel):
                                 cursor='fleur')
         self.canvas.pack(fill='both', expand=True)
         self.close_button = tk.Button(self, text='×', command=self.destroy,
-            font=('Microsoft YaHei UI', 16), fg='#007ACC', bg='#EAF4FC',
+            font=(typography.UI_FAMILY, 16), fg='#007ACC', bg='#EAF4FC',
             activebackground='#DCECF8', activeforeground='#007ACC',
             relief='flat', bd=0, highlightthickness=0, cursor='hand2', takefocus=False)
         self.canvas.bind('<ButtonPress-1>', self._start_drag)
@@ -69,7 +70,7 @@ class FloatingCaption(tk.Toplevel):
         self.bind('<Escape>', lambda event: self.destroy())
         self._hover_job = None
         self._drag_origin = None
-        self.caption_font = tkfont.Font(family='Microsoft YaHei UI', size=21)
+        self.caption_font = tkfont.Font(family=typography.UI_FAMILY, size=21)
         line_height = self.caption_font.metrics('linespace') + 8
         self.geometry(f'{self.width}x{line_height * 2 + 36}')
         self.pages = CaptionPages(self.caption_font.measure, self.width - 64)

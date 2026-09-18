@@ -1,5 +1,5 @@
 #ifndef AppVersion
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #endif
 [Setup]
 AppId={{9D469B55-B7E6-497F-89B4-FCD21C0929C1}
@@ -39,8 +39,8 @@ Type: filesandordirs; Name: "{app}\_internal\gpu-runtime"; Check: not WizardIsCo
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; Flags: checkedonce
 [Icons]
-Name: "{group}\闻录"; Filename: "{app}\Wenlu.exe"; AppUserModelID: "Wenlu.Desktop"
-Name: "{autodesktop}\闻录"; Filename: "{app}\Wenlu.exe"; AppUserModelID: "Wenlu.Desktop"; Tasks: desktopicon
+Name: "{group}\闻录"; Filename: "{app}\Wenlu.exe"; IconFilename: "{app}\_internal\assets\wenlu.ico"; AppUserModelID: "Wenlu.Desktop"
+Name: "{autodesktop}\闻录"; Filename: "{app}\Wenlu.exe"; IconFilename: "{app}\_internal\assets\wenlu.ico"; AppUserModelID: "Wenlu.Desktop"; Tasks: desktopicon
 [Run]
 Filename: "{app}\Wenlu.exe"; Description: "打开闻录"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\Wenlu.exe"; Flags: nowait; Check: RestartAfterUpdate

@@ -1,5 +1,6 @@
 """Selectable, source-labelled chat bubbles for the transcript."""
 import tkinter as tk
+import typography
 import tkinter.font as tkfont
 from scrollbars import SlimScrollbar
 from theme import color
@@ -14,11 +15,11 @@ class Bubble(tk.Frame):
         self.mine = row.get("source") == "microphone"
         self.normal = "#F0F1F3" if self.mine else "#EDF4FA"
         self.label = tk.Label(self, text=row.get("time", ""),
-                              bg=SURFACE, fg="#a3adba", font=("Microsoft YaHei UI", 8))
+                              bg=SURFACE, fg="#a3adba", font=(typography.UI_FAMILY, 8))
         self.canvas = tk.Canvas(self, bg=SURFACE, bd=0, highlightthickness=0)
-        self.text = tk.Text(self.canvas, wrap="char", font=("Microsoft YaHei UI", 10),
+        self.text = tk.Text(self.canvas, wrap="char", font=(typography.UI_FAMILY, getattr(self.winfo_toplevel(), '_body_font_size', 9)),
                             bg=self.normal, fg="#263044", bd=0, highlightthickness=0,
-                            padx=0, pady=0, spacing2=4, cursor="xterm", exportselection=False,
+                            padx=0, pady=0, spacing2=5, cursor="xterm", exportselection=False,
                             selectborderwidth=0, selectbackground="#E0E4E9" if self.mine else "#DCECF8")
         self.text.insert("1.0", row["text"])
         self.text.configure(state="disabled")
@@ -91,7 +92,7 @@ class Bubble(tk.Frame):
                     used = 0
                 used += advance
             line_count += count
-        height = line_count*self.line_height + max(0, line_count-1)*4 + 2
+        height = line_count*self.line_height + max(0, line_count-1)*5 + 2
         bubble_width, bubble_height = content+29, height+16
         x = width-bubble_width-12 if self.mine else 12
         self.canvas.place(x=x, y=8, width=bubble_width, height=bubble_height)
@@ -101,7 +102,7 @@ class Bubble(tk.Frame):
         self.canvas.itemconfigure(self.text_id, width=content, height=height)
         self.canvas.delete("shape")
         fill = color("#E0E4E9" if self.mine else "#DCECF8", self.dark) if self.selected else self.normal
-        w, h, r = bubble_width, bubble_height, 6
+        w, h, r = bubble_width, bubble_height, 8
 
         def rounded(inset, radius, color):
             # Straight sides and true quarter-circle corners, without spline bulges.

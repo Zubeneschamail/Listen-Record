@@ -2,7 +2,8 @@
 from pathlib import Path
 import math
 import tkinter as tk
-from PIL import Image, ImageTk
+import typography
+from PIL import Image, ImageDraw, ImageTk
 
 ICONS = Path(__file__).resolve().parent / 'assets' / 'icons'
 
@@ -13,8 +14,19 @@ class IconButton(tk.Button):
         self.images = {name: tk.PhotoImage(master=parent, file=str(ICONS / f'{name}.png'))
                        for name in (icon, 'check')}
         original = Image.open(ICONS / f'{icon}.png').convert('RGBA')
+        self.neutral_images = {}
+        if icon in ('settings', 'copy', 'close', 'minimize', 'more', 'add'):
+            for tone in ('#737b8c', '#AEBBCD'):
+                variants = {}
+                for name in (icon, 'check'):
+                    source = Image.open(ICONS / f'{name}.png').convert('RGBA')
+                    tinted = Image.new('RGBA', source.size, tone)
+                    tinted.putalpha(source.getchannel('A'))
+                    variants[name] = ImageTk.PhotoImage(tinted, master=parent)
+                self.neutral_images[tone.lower()] = variants
+            self.images.update(self.neutral_images['#737b8c'])
         if icon in ('microphone', 'waveform'):
-            self.active_source = Image.new('RGBA', original.size, '#D94A45')
+            self.active_source = Image.new('RGBA', original.size, '#007ACC')
             self.active_source.putalpha(original.getchannel('A'))
             self.images['active'] = ImageTk.PhotoImage(self.active_source, master=parent)
         muted = Image.new('RGBA', original.size, '#728299')
@@ -42,10 +54,14 @@ class IconButton(tk.Button):
         if 'disabledforeground' in kwargs:
             kwargs['disabledforeground'] = ''
         result = super().configure(cnf, **kwargs)
-        if 'text' in kwargs or 'state' in kwargs:
+        tone = str(self.cget('foreground')).lower()
+        if self.neutral_images and ('foreground' in kwargs or 'fg' in kwargs):
+            self.images.update(self.neutral_images.get(tone, self.neutral_images['#737b8c']))
+        if any(key in kwargs for key in ('text', 'state', 'fg', 'foreground')):
             name = ('active' if self.icon_name in ('microphone', 'waveform') and self.cget('text') == '停止转写'
                     else 'check' if self.cget('text') == '已复制' else self.icon_name)
-            image = (self.disabled_image if str(self.cget('state')) == 'disabled' else
+            finishing = self.icon_name == 'waveform' and self.cget('text') == '收尾中…'
+            image = (self.disabled_image if str(self.cget('state')) == 'disabled' and not finishing else
                      self.images[name])
             super().configure(image=image)
             if name == 'active' and str(self.cget('state')) != 'disabled':
@@ -60,17 +76,27 @@ class IconButton(tk.Button):
 
     def animate_recording(self):
         if not self.animation_frames:
-            source = self.active_source
-            for i in range(36):
-                phase = 2 * math.pi * i / 36
-                opacity = .9 + .1 * math.cos(phase)
-                frame = source.copy()
-                frame.putalpha(source.getchannel('A').point(lambda alpha: round(alpha * opacity)))
+            for i in range(48):
+                # Render once at 4x resolution for smooth rounded blue bars.
+                # Phase offsets simulate a travelling voice waveform, not movement
+                # of the button itself. No audio capture or asset files are needed.
+                phase = 2 * math.pi * i / 48
+                frame = Image.new('RGBA', (96, 96))
+                draw = ImageDraw.Draw(frame)
+                for bar, x in enumerate((3, 7.5, 12, 16.5, 21)):
+                    pulse = (1 + math.sin(phase + bar * 1.1)) / 2
+                    height = 5 + (9 + 4 * (1 - abs(bar - 2) / 2)) * pulse
+                    shade = int(50 * (1 - pulse))
+                    fill = (shade, 122 + shade, 204 + int(shade * .6), 255)
+                    draw.rounded_rectangle(((x - 1) * 4, (12 - height / 2) * 4,
+                                            (x + 1) * 4, (12 + height / 2) * 4),
+                                           radius=4, fill=fill)
+                frame = frame.resize((24, 24), Image.Resampling.LANCZOS)
                 self.animation_frames.append(ImageTk.PhotoImage(frame, master=self))
-        # Change only opacity; all frames retain identical size and position.
+        # Keep the same 24px canvas and centered bars throughout the cycle.
         super().configure(image=self.animation_frames[self.animation_frame])
         self.animation_frame = (self.animation_frame + 1) % len(self.animation_frames)
-        self.animation_timer = self.winfo_toplevel().after(50, self.animate_recording)
+        self.animation_timer = self.winfo_toplevel().after(40, self.animate_recording)
 
     def stop_animation(self, event=None):
         if event is not None and event.widget is not self:
@@ -92,7 +118,7 @@ class IconButton(tk.Button):
         tip.overrideredirect(True)
         tip.attributes('-topmost', True)
         description = {'···': '更多操作', '×': '关闭', '—': '最小化'}.get(self.cget('text'), self.cget('text'))
-        tk.Label(tip, text=description, bg='#263e52', fg='white', font=('Microsoft YaHei UI',9),
+        tk.Label(tip, text=description, bg='#263e52', fg='white', font=(typography.UI_FAMILY,9),
                  padx=9, pady=5).pack()
         tip.update_idletasks()
         x = max(0, min(self.winfo_rootx(), tip.winfo_screenwidth()-tip.winfo_reqwidth()))

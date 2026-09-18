@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
+import typography
 from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
@@ -23,10 +24,12 @@ from codex_connection import CodexConnection
 from qa_provider import APIProvider, PROVIDERS, DEFAULTS, load_settings
 import theme
 from segmentation import PauseSegmenter, WordAssembler, decode_chunk, DraftPreview
+from paragraphs import ParagraphAssembler
 from recognition import RecognitionContext, read_preferences, save_preferences
 from scrollbars import SlimScrollbar
 from chat_view import ChatView
-from icon_button import IconButton
+from ui_components import UIControls, ToggleChip
+from settings_view import build_settings
 from audio_levels import AudioLevelNormalizer
 from model_runtime import load_model
 from floating_caption import FloatingCaption
@@ -112,6 +115,7 @@ class Transcriber:
         chunks = queue.Queue(maxsize=1200)
         overflow = threading.Event()
         origin = 0.0
+        paragraphs = ParagraphAssembler()
         try:
             self.emit("status", "正在加载本地模型…")
             if self.model_name != model_name:
@@ -178,13 +182,15 @@ class Transcriber:
                         if text:
                             row = make_segment(start, end, text, epoch)
                             row["source"] = source
-                            self.emit("segment", row)
+                            for paragraph in paragraphs.consume(row):
+                                self.emit("segment", paragraph)
                     pending = state["assembler"].pending
-                    self.emit("preview", {"source": source, "text": clean_caption(pending[2]) if pending else ""})
+                    self.emit("preview", {"source": source, "text": paragraphs.preview(source, clean_caption(pending[2]) if pending else "")})
                     state["preview"].defer()
 
             while not self.stop_event.is_set() or not chunks.empty():
                 if self.context_reset.is_set():
+                    paragraphs.pending = None
                     for state in states.values():
                         state["guidance"].history.clear()
                         state["guidance"].last_end = None
@@ -195,6 +201,9 @@ class Transcriber:
                     for source, state in states.items():
                         if time.monotonic() - state["received"] > 0.7:
                             transcribe(source, state["segmenter"].finish())
+                        if time.monotonic() - state["received"] >= paragraphs.pause and paragraphs.pending and paragraphs.pending['source'] == source:
+                            for paragraph in paragraphs.finish():
+                                self.emit('segment', paragraph)
                         if not self.stop_event.is_set() and not state["stream"].is_active():
                             raise RuntimeError("音频设备已断开或停止响应，请刷新设备后重试。")
                     continue
@@ -204,6 +213,17 @@ class Transcriber:
                     raise RuntimeError("音频设备已断开或停止响应，请刷新设备后重试。")
                 audio = state["levels"].process(mono_16k(samples, state["rate"]))
                 transcribe(source, state["segmenter"].push(audio, offset, block_epoch))
+                for paragraph in paragraphs.silence(source, offset + len(audio)/16000,
+                        getattr(state['segmenter'], 'last_speech_end', None)):
+                    self.emit('segment', paragraph)
+                if paragraphs.pending and chunks.empty():
+                    owner = paragraphs.pending['source']
+                    if owner != source and time.monotonic()-states[owner]['received'] >= paragraphs.pause:
+                        # Loopback can stop delivering samples while the mic keeps
+                        # delivering silence, so the queue-empty handler never runs.
+                        transcribe(owner, states[owner]['segmenter'].finish())
+                        for paragraph in paragraphs.finish():
+                            self.emit('segment', paragraph)
                 backlog = chunks.qsize() / (10 * len(states))
                 self.emit("backlog", backlog)
                 try:
@@ -214,7 +234,7 @@ class Transcriber:
                     state["preview"].defer()
                     draft = None
                 if draft is not None and not self.stop_event.is_set():
-                    self.emit("preview", {"source": source, "text": clean_caption(draft)})
+                    self.emit("preview", {"source": source, "text": paragraphs.preview(source, clean_caption(draft))})
             for source, state in states.items():
                 transcribe(source, state["segmenter"].finish())
             if overflow.is_set():
@@ -223,6 +243,8 @@ class Transcriber:
             logging.exception("Transcription failed")
             self.emit("error", str(exc))
         finally:
+            for paragraph in paragraphs.finish():
+                self.emit('segment', paragraph)
             self.stop_event.set()
             for stream in streams:
                 try:
@@ -238,17 +260,28 @@ class Transcriber:
 class App:
     def __init__(self, root):
         self.root = root
+        typography.setup(root)
         self.events = queue.Queue()
         self.engine = Transcriber(self.events)
         self.qa = CodexQA(self.events)
+        self.qa.context_provider = self.session_context_snapshot
         self.codex_connection = CodexConnection(self.events)
         self.qa_settings = load_settings()
         self.qa_provider_name = tk.StringVar(value=PROVIDERS[self.qa_settings['provider']])
         self.codex_status = tk.StringVar(value="尚未检测")
         self.codex_detail = tk.StringVar(value="点击检测会发送测试请求，消耗少量 Codex 额度。")
         self.dark_mode = tk.BooleanVar(value=preferences().get('dark_mode', False))
+        try:
+            size = max(8, min(16, int(preferences().get('font_size', 9))))
+        except (ValueError, TypeError):
+            size = 9
+        self.font_size = tk.IntVar(value=size)
+        root._body_font_size = size
         self.qa_enabled = tk.BooleanVar(value=False)
+        self.auto_qa = tk.BooleanVar(value=False)
         self.qa_history = []
+        self.qa_display_history = []
+        self.question_drafts = {}
         self.qa_cache = {}
         self.qa_selection = None
         self.multi_rows = set()
@@ -283,8 +316,8 @@ class App:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TFrame", background="#f7f8fa")
-        style.configure("TLabel", background="#f7f8fa", foreground="#858b98", font=("Microsoft YaHei UI", 9))
-        style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=5)
+        style.configure("TLabel", background="#f7f8fa", foreground="#858b98", font=(typography.UI_FAMILY, 9))
+        style.configure("TButton", font=(typography.UI_FAMILY, 9), padding=5)
         # Clam's default readonly inputs use a dark, raised system-control face.
         # Give every settings input the same quiet surface as the content cards.
         for control in ("Settings.TCombobox", "Settings.TEntry"):
@@ -298,7 +331,7 @@ class App:
                       foreground=[("disabled", "#a2a8b5"), ("readonly", "#4f586b")],
                       bordercolor=[("focus", "#78B7E3"), ("active", "#B5D5ED")],
                       lightcolor=[("focus", "white")], darkcolor=[("focus", "white")])
-        root.option_add("*TCombobox*Listbox.font", ("Microsoft YaHei UI", 9))
+        root.option_add("*TCombobox*Listbox.font", (typography.UI_FAMILY, 9))
         root.option_add("*TCombobox*Listbox.background", "white")
         root.option_add("*TCombobox*Listbox.foreground", "#4f586b")
         root.option_add("*TCombobox*Listbox.selectBackground", "#E6F2FB")
@@ -309,36 +342,18 @@ class App:
         frame = self.main_frame = ttk.Frame(root, padding=(12, 8, 12, 12))
         frame.pack(fill="both", expand=True, padx=1, pady=1)
 
-        def button(parent, text, command, primary=False, width=None):
-            surface = parent.cget("bg") if isinstance(parent, tk.Frame) else "#f7f8fa"
-            icons = {"设置": "settings", "复制全文": "copy", "复制": "copy", "···": "more",
-                     "刷新": "refresh", "×": "close", "—": "minimize", "发送所选": "send",
-                     "开始转写": "waveform", "停止转写": "waveform"}
-            factory = IconButton if text in icons else tk.Button
-            widget = factory(parent, **({"icon": icons[text]} if text in icons else {}),
-                             text=text, command=command, relief="flat", bd=0,
-                             bg="#007ACC" if primary else surface,
-                             fg="white" if primary else "#737b8c", activebackground="#006BB3" if primary else "#E6F2FB",
-                             activeforeground="white" if primary else "#007ACC", disabledforeground="#a6acba",
-                             font=("Microsoft YaHei UI", 9), padx=10, pady=5,
-                             cursor="hand2", takefocus=True, **({"width": width} if width else {}))
-            normal_bg = widget.cget("bg")
-            widget.bind("<Enter>", lambda e: widget.configure(bg=self.theme_color("#006BB3" if primary else "#EDF5FB")) if str(widget.cget("state")) != "disabled" else None, add="+")
-            widget.bind("<Leave>", lambda e: widget.configure(bg=self.theme_color(normal_bg)), add="+")
-            return widget
+        button = UIControls(self).button
 
         header = self.header = ttk.Frame(frame)
         header.pack(fill="x", pady=(0, 8))
         self.brand_image = tk.PhotoImage(file=str(ROOT / "assets" / "logo-24.png"))
         brand = ttk.Label(header, image=self.brand_image)
         brand.pack(side="left", padx=(0, 7))
-        title = ttk.Label(header, text="闻录", foreground="#263044", font=("Microsoft YaHei UI", 12, "bold"))
-        title.pack(side="left", padx=(0, 12))
         hint = ttk.Label(header, text="", foreground="#bd544f")
         self.hotkey_hint = hint
         drag_space = ttk.Frame(header)
         drag_space.pack(side="left", fill="x", expand=True)
-        for widget in (header, brand, title, hint, drag_space):
+        for widget in (header, brand, hint, drag_space):
             widget.bind("<ButtonPress-1>", self.drag_begin)
             widget.bind("<B1-Motion>", self.drag_move)
         button(header, "×", self.close).pack(side="right")
@@ -347,91 +362,36 @@ class App:
         self.settings_button.pack(side="right", padx=(4, 0))
         self.settings_button.bind("<Leave>", lambda e: self.settings_button.configure(
             bg=self.theme_color("#E6F2FB" if self.settings_visible else "#f7f8fa")), add="+")
-        tk.Checkbutton(header, text="AI", variable=self.qa_enabled, command=self.toggle_qa,
-                       indicatoron=False, selectcolor="#E6F2FB", relief="flat", padx=11, pady=5,
-                       bg="#f7f8fa", activebackground="#f7f8fa", fg="#737b8c",
-                       font=("Microsoft YaHei UI", 9), bd=0, highlightthickness=0).pack(side="right")
+        self.ai_button = ToggleChip(header, 'AI', self.qa_enabled, self.toggle_qa, surface='#f7f8fa')
+        self.ai_button.pack(side='right', padx=(4, 0))
 
-        self.settings_window = tk.Toplevel(root)
-        self.settings_window.withdraw()
-        self.settings_window.title("闻录 · 设置")
-        self.settings_window.transient(root)
-        self.settings_window.resizable(False, False)
-        self.settings_window.configure(bg="#e0e3ea")
-        self.settings_window.protocol("WM_DELETE_WINDOW", self.hide_settings)
-        self.settings_window.bind("<Escape>", self.hide_settings)
-        self.settings_panel = ttk.Frame(self.settings_window, padding=20)
-        self.settings_panel.pack(fill="both", expand=True, padx=1, pady=1)
-        self.capture_mode = tk.StringVar(value="系统声音 + 麦克风")
-        ttk.Label(self.settings_panel, text="采集").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-        self.mode = ttk.Combobox(self.settings_panel, textvariable=self.capture_mode, state="readonly",
-                                values=["系统声音 + 麦克风", "仅系统声音", "仅麦克风"],
-                                style="Settings.TCombobox", font=("Microsoft YaHei UI", 9))
-        self.mode.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 8))
-        ttk.Label(self.settings_panel, text="麦克风").grid(row=1, column=0, sticky="w", pady=(0, 8))
-        self.microphone = ttk.Combobox(self.settings_panel, state="readonly", style="Settings.TCombobox",
-                                      font=("Microsoft YaHei UI", 9))
-        self.microphone.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(0, 8))
-        ttk.Label(self.settings_panel, text="系统声音").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
-        self.device = ttk.Combobox(self.settings_panel, state="readonly", width=24,
-                                   style="Settings.TCombobox", font=("Microsoft YaHei UI", 9))
-        self.device.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(0, 8))
-        self.refresh_button = button(self.settings_panel, "刷新", self.refresh)
-        self.refresh_button.grid(row=2, column=3, sticky="e", pady=(0, 8))
-        ttk.Label(self.settings_panel, text="识别").grid(row=3, column=0, sticky="w", padx=(0, 12))
-        self.model = ttk.Combobox(self.settings_panel, state="readonly", width=23,
-                                  style="Settings.TCombobox", font=("Microsoft YaHei UI", 9),
-                                  values=["small · 轻量准确", "large-v3-turbo · 高性能", "base · 均衡", "tiny · 更快"])
-        self.model.current(0)
-        self.model_label = tk.StringVar(value=self.model.get())
-        self.model.configure(textvariable=self.model_label)
-        self.model_manage_button = button(self.settings_panel, '', self.open_model_manager)
-        self.model_manage_button.configure(textvariable=self.model_label, anchor='w', bg='white', fg='#4f586b')
-        self.model_manage_button.grid(row=3, column=1, sticky="ew", padx=(0, 8))
-        self.language = ttk.Combobox(self.settings_panel, state="readonly", width=10,
-                                     style="Settings.TCombobox", font=("Microsoft YaHei UI", 9),
-                                     values=["中文", "自动检测", "英语"])
-        self.language.current(0)
-        self.language.grid(row=3, column=2, sticky="ew")
-        self.settings_panel.columnconfigure(1, weight=2)
-        self.settings_panel.columnconfigure(2, weight=1)
-        self.hotkey_status = tk.StringVar(value="")
-        self.hotkey_error = ttk.Label(self.settings_panel, textvariable=self.hotkey_status,
-                                      foreground="#bd544f", wraplength=460)
-        ttk.Label(self.settings_panel, text="问答会将所选文字及附近前文发送给所选模型服务，并消耗对应服务额度。",
-                  wraplength=460).grid(row=6, column=0, columnspan=4, sticky="w", pady=(16, 0))
-        self.hotwords = tk.StringVar(value=read_preferences(DATA / "recognition-settings.json"))
-        ttk.Label(self.settings_panel, text="热词 / 纠错").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        self.hotwords_entry = ttk.Entry(self.settings_panel, textvariable=self.hotwords,
-                                        style="Settings.TEntry", font=("Microsoft YaHei UI", 9))
-        self.hotwords_entry.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Label(self.settings_panel, text="逗号分隔；定向纠错示例：大模形=大模型").grid(row=5, column=1, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Label(self.settings_panel, textvariable=self.qa_provider_name).grid(row=7, column=0, sticky="w", pady=(12, 0))
-        ttk.Label(self.settings_panel, textvariable=self.codex_status).grid(row=7, column=1, sticky="w", pady=(12, 0))
-        button(self.settings_panel, "模型服务…", self.open_qa_settings).grid(row=7, column=2, sticky="e", pady=(12, 0))
-        self.codex_check_button = button(self.settings_panel, "检查连接", self.check_codex_connection)
-        self.codex_check_button.grid(row=7, column=3, sticky="e", pady=(12, 0))
-        ttk.Label(self.settings_panel, textvariable=self.codex_detail, wraplength=460).grid(
-            row=8, column=0, columnspan=4, sticky="w", pady=(5, 0))
-        ttk.Checkbutton(self.settings_panel, text="深色模式", variable=self.dark_mode,
-                        command=self.change_theme).grid(row=9, column=0, columnspan=2, sticky="w", pady=(16, 0))
-        button(self.settings_panel, "完成", self.hide_settings, primary=True).grid(
-            row=9, column=2, columnspan=2, sticky="e", pady=(16, 0))
+        build_settings(self, button)
 
         self.body = ttk.Frame(frame)
         self.body.pack(fill="both", expand=True)
         controls = self.controls = ttk.Frame(header)
         controls.pack(side="right", padx=(0, 6))
-        self.more_button = button(controls, "···", self.open_menu)
-        self.more_button.pack(side="right")
         self.footer = tk.StringVar(value="自动保存")
         self.storage_hint = tk.StringVar(value="自动保存")
-        ttk.Label(controls, textvariable=self.storage_hint, font=("Microsoft YaHei UI", 8), foreground="#a0a6b2").pack(side="right", padx=8)
-        grip = self.resize_grip = ttk.Label(root, text="◢", cursor="size_nw_se", font=("Segoe UI", 8))
-        grip.place(relx=1, rely=1, anchor="se")
-        grip.bind("<ButtonPress-1>", self.resize_begin)
-        grip.bind("<B1-Motion>", self.resize_move)
-        grip.bind("<ButtonRelease-1>", self.flush_resize)
+        ttk.Label(controls, textvariable=self.storage_hint, font=(typography.UI_FAMILY, 8), foreground="#a0a6b2").pack(side="right", padx=8)
+        self.resize_handles = {}
+        edges = {
+            'n': ('size_ns', dict(x=8, y=0, relwidth=1, width=-16, height=4)),
+            's': ('size_ns', dict(x=8, rely=1, y=-4, relwidth=1, width=-16, height=4)),
+            'w': ('size_we', dict(x=0, y=8, width=4, relheight=1, height=-16)),
+            'e': ('size_we', dict(relx=1, x=-4, y=8, width=4, relheight=1, height=-16)),
+            'nw': ('size_nw_se', dict(x=0, y=0, width=8, height=8)),
+            'ne': ('size_ne_sw', dict(relx=1, x=-8, y=0, width=8, height=8)),
+            'sw': ('size_ne_sw', dict(x=0, rely=1, y=-8, width=8, height=8)),
+            'se': ('size_nw_se', dict(relx=1, x=-8, rely=1, y=-8, width=8, height=8)),
+        }
+        for edge, (cursor, placement) in edges.items():
+            handle = tk.Frame(root, bg="#f7f8fa", bd=0, cursor=cursor)
+            handle.place(**placement)
+            handle.bind('<ButtonPress-1>', lambda event, edge=edge: self.resize_begin(event, edge))
+            handle.bind('<B1-Motion>', self.resize_move)
+            handle.bind('<ButtonRelease-1>', self.flush_resize)
+            self.resize_handles[edge] = handle
 
         self.status = tk.StringVar(value="准备就绪")
         self.status_label = ttk.Label(self.body, textvariable=self.status, wraplength=510)
@@ -442,10 +402,10 @@ class App:
                                       opaqueresize=False, proxybackground="#007ACC",
                                       proxyborderwidth=0, proxyrelief="flat")
         self.columns.pack(fill="both", expand=True)
-        self.left_panel = tk.Frame(self.columns, bg="white", highlightbackground="#eceef3", highlightcolor="#eceef3", highlightthickness=1)
+        self.left_panel = tk.Frame(self.columns, bg="white", highlightbackground="#E3E9F0", highlightcolor="#E3E9F0", highlightthickness=1)
         self.copy_button = button(self.left_panel, "复制全文", self.copy)
         self.columns.add(self.left_panel, minsize=150, stretch="always")
-        self.text = tk.Text(self.left_panel, wrap="word", font=("Microsoft YaHei UI", 10),
+        self.text = tk.Text(self.left_panel, wrap="word", font=(typography.UI_FAMILY, 10),
                             bg="white", fg="#263044", relief="flat", bd=0, highlightthickness=0,
                             padx=14, pady=6, state="disabled", spacing1=2, spacing2=3, spacing3=10, height=5, width=1,
                             exportselection=False)
@@ -464,53 +424,46 @@ class App:
         self.text.tag_configure("qa_selected", background="#E6F2FB", foreground="#007ACC")
         self.text.bind("<ButtonPress-1>", self.question_press)
         self.text.bind("<ButtonRelease-1>", self.question_release)
-        self.qa_panel = tk.Frame(self.columns, bg="white", highlightbackground="#eceef3", highlightcolor="#eceef3", highlightthickness=1)
-        qa_header = self.qa_header = tk.Frame(self.qa_panel, bg="white", padx=10, pady=3)
+        self.qa_panel = tk.Frame(self.columns, bg="white", highlightbackground="#E3E9F0", highlightcolor="#E3E9F0", highlightthickness=1)
+        qa_header = self.qa_header = tk.Frame(self.qa_panel, bg="white", padx=12, pady=5)
         qa_header.pack(fill="x")
-        tk.Label(qa_header, textvariable=self.qa_provider_name, bg="white", fg="#007ACC", font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
+        tk.Label(qa_header, textvariable=self.qa_provider_name, bg="white", fg="#737b8c", font=(typography.UI_FAMILY, 9, "bold")).pack(side="left")
         self.answer_copy_button = button(qa_header, "复制", self.copy_answer)
-        self.answer_copy_button.configure(bg="white", font=("Microsoft YaHei UI", 8))
+        self.answer_copy_button.configure(bg="white", font=(typography.UI_FAMILY, 8))
         self.answer_copy_button.pack(side="right")
         self.codex_status_label = tk.Label(qa_header, textvariable=self.codex_status,
-                                          bg="white", fg="#9297a4", font=("Microsoft YaHei UI", 8))
+                                          bg="white", fg="#9297a4", font=(typography.UI_FAMILY, 8))
         self.codex_status_label.pack(side="left", padx=(8, 0))
+        self.auto_button = ToggleChip(qa_header, 'Auto', self.auto_qa, self.toggle_auto_qa)
+        self.auto_button.pack(side="right", padx=(4, 0), before=self.codex_status_label)
         # Keep a drag surface when the normal title bar is hidden. Text widgets
         # retain their selection behavior; copy/send buttons remain clickable.
         for widget in (qa_header, self.chat.canvas, self.chat.inner,
                        *(child for child in qa_header.winfo_children() if isinstance(child, tk.Label))):
-            widget.bind('<ButtonPress-1>', self.drag_begin, add='+')
-            widget.bind('<B1-Motion>', self.drag_move, add='+')
-        qa_header.configure(cursor='fleur')
+            widget.bind('<ButtonPress-1>', self.focus_drag_begin, add='+')
+            widget.bind('<B1-Motion>', self.focus_drag_move, add='+')
         qa_footer = tk.Frame(self.qa_panel, bg="white")
         qa_footer.pack(side="bottom", fill="x", padx=10, pady=(2, 3))
         self.ask_selected_button = button(qa_footer, "发送所选", self.ask_selected)
         self.ask_selected_button.pack(side="right")
-        self.qa_status_label = tk.Label(qa_footer, textvariable=self.qa_status, width=1,
-                                        bg="white", fg="#9297a4", font=("Microsoft YaHei UI", 8), anchor="w", justify="left")
+        from reference_settings import build_add_button
+        build_add_button(self, qa_footer)
+        from reference_settings import ReferencePathLabel
+        self.qa_status_label = self.reference_path_label = ReferencePathLabel(
+            qa_footer, self.qa_status, self.reference_controls['remove_path'])
+        self.reference_path_label.set_paths(self.reference_controls['paths']())
         self.qa_status_label.pack(side="left", fill="x", expand=True)
         self.qa_text = tk.Text(self.qa_panel, wrap="word", bg="white", fg="#263044", relief="flat",
-                              font=("Microsoft YaHei UI", 10), padx=14, pady=6, spacing1=2, spacing2=3, spacing3=10,
+                              font=(typography.UI_FAMILY, self.font_size.get()), padx=16, pady=10, spacing1=2, spacing2=5, spacing3=12,
                               state="disabled", width=1, height=1)
-        self.qa_text.tag_configure("question", foreground="#527F9E", spacing3=14)
+        self.qa_text.tag_configure("question", foreground="#007ACC", spacing1=8, spacing3=10)
+        self.qa_text.tag_bind("question", "<Button-1>", self.edit_question)
         self.qa_text.pack(fill="both", expand=True)
         self.answer_scrollbar = SlimScrollbar(self.qa_text)
         self.qa_placeholder = tk.Label(self.qa_text, text="选择文字，开始提问", bg="white", fg="#a0a5b1",
-                                       font=("Microsoft YaHei UI", 9), justify="center")
+                                       font=(typography.UI_FAMILY, 9), justify="center")
         self.qa_placeholder.place(relx=0.5, rely=0.42, anchor="center")
         self.qa_status.set("")
-        self.menu = tk.Menu(root, tearoff=False, font=("Microsoft YaHei UI", 10))
-        self.menu.add_command(label="导出 TXT / SRT", command=self.export)
-        self.menu.add_command(label="悬浮字幕", command=self.open_caption)
-        self.menu.add_command(label="窗口置顶", command=self.toggle_pin)
-        self.menu.add_separator()
-        self.menu.add_command(label="清空当前对话", accelerator="Ctrl+Backspace", command=self.clear_conversation)
-        self.menu.add_command(label="查看模型回答", command=self.open_qa)
-        self.menu.add_separator()
-        self.menu.add_command(label="模型管理", command=self.open_model_manager)
-        self.menu.add_command(label="打开历史记录", command=lambda: self.open_folder(RECORDINGS))
-        self.menu.add_command(label="迁移旧版数据", command=self.import_legacy_data)
-        self.menu.add_command(label="最小化到托盘", command=self.hide_to_tray)
-        self.menu.add_command(label="关于 / 检查更新", command=self.open_about)
         self.refresh()
         self.load_desktop_settings()
         self.tray = None
@@ -520,10 +473,12 @@ class App:
         root.bind("<Configure>", self.on_resize)
         self.focus_mode = False
         root.bind('<F11>', self.toggle_focus_mode)
+        root.bind('<F12>', self.toggle_auto_shortcut)
         root.bind('<Escape>', self.exit_focus_mode)
         for widget in (root, self.text, self.qa_text):
             widget.bind("<Control-BackSpace>", self.clear_conversation)
         root.after(100, self.enable_taskbar)
+        root.bind("<Map>", self.on_main_window_mapped, add="+")
         root.after(200, self.start_tray)
         root.after(100, self.poll)
         self.hotkey.start()
@@ -545,7 +500,8 @@ class App:
         self.open_qa()
         self.header.pack_forget()
         self.status_label.pack_forget()
-        self.resize_grip.lift()
+        for handle in self.resize_handles.values():
+            handle.lift()
         self.main_frame.configure(padding=0)
         self.main_frame.pack_configure(padx=0, pady=0)
         return 'break'
@@ -558,7 +514,8 @@ class App:
         self.main_frame.configure(padding=(12, 8, 12, 12))
         self.main_frame.pack_configure(padx=1, pady=1)
         self.header.pack(fill='x', pady=(0, 8), before=self.body)
-        self.resize_grip.place(relx=1, rely=1, anchor='se')
+        for handle in self.resize_handles.values():
+            handle.lift()
         if not view['qa']:
             self.qa_enabled.set(False)
             self.toggle_qa()
@@ -576,6 +533,19 @@ class App:
         self.apply_theme()
         self.save_desktop_settings()
 
+    def change_font_size(self, event=None):
+        size = self.font_size.get()
+        self.root._body_font_size = size
+        self.qa_text.configure(font=(typography.UI_FAMILY, size))
+        self.text.configure(font=(typography.UI_FAMILY, size))
+        for bubble in self.chat.bubbles.values():
+            bubble.font.configure(size=size)
+            bubble.text.configure(font=bubble.font)
+            bubble.measured_text = None
+            bubble.layout_key = None
+        self.chat.resize()
+        self.save_desktop_settings()
+
     def load_desktop_settings(self):
         values = preferences()
         for key, widget in (("model", self.model), ("language", self.language),
@@ -587,7 +557,8 @@ class App:
         try:
             save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
             save_desktop(dict(model=self.model.get(), language=self.language.get(), mode=self.mode.get(),
-                              output=self.device.get(), input=self.microphone.get(), dark_mode=self.dark_mode.get()))
+                              output=self.device.get(), input=self.microphone.get(), dark_mode=self.dark_mode.get(),
+                              font_size=self.font_size.get()))
         except OSError:
             logging.exception('Saving desktop settings')
 
@@ -641,13 +612,26 @@ class App:
     def drag_begin(self, event):
         self._drag_origin = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
+    def focus_drag_begin(self, event):
+        self._drag_origin = None
+        if self.focus_mode:
+            self.drag_begin(event)
+
+    def focus_drag_move(self, event):
+        if self.focus_mode:
+            self.drag_move(event)
+
     def drag_move(self, event):
         if self._drag_origin:
             x, y = event.x_root - self._drag_origin[0], event.y_root - self._drag_origin[1]
-            self.root.geometry(f"{x:+d}{y:+d}")
+            # A leading '-' means distance from the opposite screen edge in
+            # Tk geometry. '+-20' is the absolute coordinate -20 instead.
+            self.root.geometry(f"+{x}+{y}")
 
-    def resize_begin(self, event):
+    def resize_begin(self, event, edge='se'):
         self._resize_origin = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
+        self._resize_edge = edge
+        self._resize_position = (self.root.winfo_rootx(), self.root.winfo_rooty())
         self._pending_geometry = None
         self.clear_resize_preview()
         preview = self._resize_preview = tk.Toplevel(self.root)
@@ -660,7 +644,7 @@ class App:
         tk.Frame(preview, bg='#ff00ff', highlightbackground='#007ACC',
                  highlightthickness=2, bd=0).pack(fill='both', expand=True)
         preview.geometry(f'{self.root.winfo_width()}x{self.root.winfo_height()}'
-                         f'{self.root.winfo_rootx():+d}{self.root.winfo_rooty():+d}')
+                         f'+{self.root.winfo_rootx()}+{self.root.winfo_rooty()}')
         preview.deiconify()
 
     def clear_resize_preview(self):
@@ -671,11 +655,22 @@ class App:
 
     def resize_move(self, event):
         x, y, width, height = self._resize_origin
-        self._pending_geometry = f"{max(420, width + event.x_root - x)}x{max(280, height + event.y_root - y)}"
+        edge = getattr(self, '_resize_edge', 'se')
+        left, top = getattr(self, '_resize_position', (self.root.winfo_rootx(), self.root.winfo_rooty()))
+        dx, dy = event.x_root - x, event.y_root - y
+        new_width = max(420, width + (-dx if 'w' in edge else dx if 'e' in edge else 0))
+        new_height = max(280, height + (-dy if 'n' in edge else dy if 's' in edge else 0))
+        if 'w' in edge:
+            left += width - new_width
+        if 'n' in edge:
+            top += height - new_height
+        position = f'+{left}+{top}'
+        self._pending_geometry = f'{new_width}x{new_height}'
+        if 'w' in edge or 'n' in edge:
+            self._pending_geometry += position
         preview = getattr(self, '_resize_preview', None)
         if preview is not None:
-            preview.geometry(self._pending_geometry +
-                             f'{self.root.winfo_rootx():+d}{self.root.winfo_rooty():+d}')
+            preview.geometry(f'{new_width}x{new_height}' + position)
 
     def flush_resize(self, event=None):
         if event is not None and getattr(self, '_resize_preview', None) is not None:
@@ -691,7 +686,13 @@ class App:
             self._status_width = event.width
             self.status_label.configure(wraplength=max(360, event.width - 34))
 
+    def on_main_window_mapped(self, event):
+        if event.widget is self.root:
+            self.root.after_idle(self.enable_taskbar)
+
     def enable_taskbar(self, window=None):
+        from window_effects import apply_shadow
+        apply_shadow(window or self.root)
         # Keep a taskbar entry even though Tk's native window decorations are hidden.
         import ctypes
         from ctypes import wintypes
@@ -702,6 +703,9 @@ class App:
         user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
         hwnd = user32.GetParent((window or self.root).winfo_id())
         style = user32.GetWindowLongW(hwnd, -20)
+        desired = (style | 0x00040000) & ~0x00000080
+        if style == desired:
+            return
         # Explorer only re-evaluates a visible window's taskbar eligibility when
         # it is shown again. Changing the extended style alone is insufficient.
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -709,43 +713,34 @@ class App:
         visible = user32.IsWindowVisible(hwnd)
         if visible:
             user32.ShowWindow(hwnd, 0)
-        user32.SetWindowLongW(hwnd, -20, (style | 0x00040000) & ~0x00000080)
-        icon = ROOT / 'assets' / 'wenlu.ico'
-        if icon.exists():
-            (window or self.root).iconbitmap(str(icon))
+        user32.SetWindowLongW(hwnd, -20, desired)
         if visible:
             user32.ShowWindow(hwnd, 5)
 
     def minimize(self):
-        # Native minimize preserves the borderless HWND; toggling Tk decorations
-        # recreates it and can leave the restored window hidden on Windows.
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        user32.GetParent.argtypes = [wintypes.HWND]
-        user32.GetParent.restype = wintypes.HWND
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.ShowWindow(user32.GetParent(self.root.winfo_id()), 6)
+        self.hide_to_tray()
 
     def toggle_settings(self):
         if self.settings_visible:
             self.settings_window.lift()
             return
         self.settings_visible = True
-        self.settings_button.configure(bg=self.theme_color("#E6F2FB"), fg="#007ACC")
+        self.settings_button.configure(bg=self.theme_color("#E6F2FB"), fg=self.theme_color("#737b8c"))
         window = self.settings_window
         window.update_idletasks()
-        width, height = max(520, window.winfo_reqwidth()), window.winfo_reqheight()
+        width, height = 480, 440
         x = max(0, min(self.root.winfo_rootx() + (self.root.winfo_width()-width)//2,
                        window.winfo_screenwidth()-width))
         y = max(0, min(self.root.winfo_rooty() + (self.root.winfo_height()-height)//2,
                        window.winfo_screenheight()-height-40))
         window.geometry(f"{width}x{height}+{x}+{y}")
         window.deiconify()
+        from window_effects import apply_shadow
+        self.root.after_idle(lambda: apply_shadow(window))
         self.root.after_idle(self.apply_theme)
         window.lift()
         window.grab_set()
-        self.device.focus_set()
+        self.settings_tabs.focus_set()
 
     def hide_settings(self, event=None):
         self.save_desktop_settings()
@@ -756,16 +751,11 @@ class App:
         self.root.focus_set()
         return "break"
 
-    def open_menu(self):
-        try:
-            self.menu.tk_popup(self.more_button.winfo_rootx(), self.more_button.winfo_rooty())
-        finally:
-            self.menu.grab_release()
-
     def toggle_pin(self):
         self.pinned = not self.pinned
         self.root.attributes("-topmost", self.pinned)
-        self.menu.entryconfigure(2, label="取消置顶" if self.pinned else "窗口置顶")
+        self.root.after_idle(self.enable_taskbar)
+        self.pin_button.configure(text="取消置顶" if self.pinned else "置顶窗口")
 
     def toggle_recording(self):
         if self.closing or (self.busy and self.engine.stop_event.is_set()):
@@ -808,7 +798,6 @@ class App:
         self.busy = busy
         if not busy:
             self.storage_hint.set("自动保存")
-        self.refresh_button.configure(state="disabled" if busy else "normal")
         self.hotwords_entry.configure(state="disabled" if busy else "normal")
         for widget in (self.device, self.microphone, self.mode, self.model, self.language):
             widget.configure(state="disabled" if busy else "readonly")
@@ -830,8 +819,8 @@ class App:
         except OSError as exc:
             messagebox.showerror("无法保存热词", str(exc))
             return
-        # Every start is a fresh recording with its own time origin and file.
-        self.clear()
+        # Recording files have separate time origins; the visible conversation
+        # and AI state persist across stop/start until explicitly cleared.
         try:
             folder = RECORDINGS
             folder.mkdir(exist_ok=True)
@@ -840,6 +829,7 @@ class App:
         except OSError as exc:
             messagebox.showerror("无法保存记录", str(exc))
             return
+        self.session_rows = []
         self.failed = False
         self.set_busy(True)
         self.engine.start(selected,
@@ -853,8 +843,11 @@ class App:
         self.status.set("正在处理剩余音频…")
 
     def clear(self, preserve_recording=False):
+        self.cancel_question_edit()
         self.qa.reset()
         self.qa_history.clear()
+        self.qa_display_history.clear()
+        self.question_drafts.clear()
         self.qa_cache.clear()
         self.qa_selection = None
         self.multi_rows.clear()
@@ -919,6 +912,8 @@ class App:
             self.text.see("end")
 
     def toggle_qa(self):
+        if not self.qa_enabled.get():
+            self.auto_qa.set(False)
         self.qa.set_enabled(self.qa_enabled.get())
         self.text.tag_remove("qa_selected", "1.0", "end")
         self.chat.highlight(set())
@@ -935,6 +930,33 @@ class App:
             self.columns.forget(self.qa_panel)
             self.qa_status.set("问答已关闭")
 
+    def toggle_auto_shortcut(self, event=None):
+        if self.closing or self.root.grab_current():
+            return 'break'
+        self.open_qa()
+        self.auto_qa.set(not self.auto_qa.get())
+        self.toggle_auto_qa()
+        return 'break'
+
+    def session_context_snapshot(self):
+        # Snapshot on the UI thread; compression runs on the request worker.
+        if not self.auto_qa.get():
+            return None
+        return ([(row.get('source', 'system'), row['text']) for row in self.rows],
+                [tuple(turn) for turn in self.qa_history])
+
+    def toggle_auto_qa(self):
+        # Reset pending work so turning Auto off cancels its in-flight response.
+        self.qa.reset()
+        self.qa_selection = None
+        self.clear_question_selection()
+        if self.auto_qa.get():
+            # History provides context only; never submit old questions on enable.
+            self.qa.context.extend(row['text'][-1200:] for row in self.rows[-8:])
+            self.qa_status.set("自动识别后续问题…")
+        else:
+            self.qa_status.set("")
+
     def open_qa_settings(self):
         from qa_settings_dialog import show
         show(self)
@@ -950,10 +972,11 @@ class App:
             self.codex_connection = CodexConnection(self.events)
         else:
             profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
-            backend = APIProvider(provider, profile)
+            from reference_files import load_settings as load_references
+            backend = APIProvider(provider, profile, workspace_loader=load_references)
             self.qa.stream_runner = backend.run
             self.codex_connection = CodexConnection(self.events, login=backend.preflight,
-                probe=lambda cancel: backend.run('只回复 OK。', cancel, timeout=30),
+                probe=lambda cancel: backend.run('只回复 OK。', cancel, timeout=30, use_references=False),
                 name=PROVIDERS[provider], failure=backend.failure)
         self.qa_cache.clear()
         self.qa_selection = None
@@ -975,7 +998,7 @@ class App:
                   "unauthenticated": "未登录", "authenticated": "已登录 · 待验证",
                   "verified": "响应正常", "unavailable": "连接异常"}
         if self.qa_settings['provider'] != 'codex':
-            labels.update(authenticated="已配置 · 待验证", unauthenticated="未配置密钥")
+            labels.update(authenticated="待验证", unauthenticated="未配置密钥")
         self.codex_status.set("● " + labels[state])
         self.codex_detail.set(self.codex_connection.detail)
         status_color = {"verified": "#15803D", "checking": "#2563EB",
@@ -1066,6 +1089,21 @@ class App:
         self.render_qa()
 
     def ask_selected(self):
+        editor = getattr(self, 'question_editor', None)
+        if editor is not None:
+            revised = editor.get('1.0', 'end-1c').strip()
+            if not revised or len(revised) > 2400:
+                self.qa_status.set('请输入问题，最多 2400 字')
+                editor.bell()
+                return
+            if not self.qa.enabled or self.codex_connection.state not in ('authenticated', 'verified'):
+                self.qa_status.set('请先启用 AI 并检查模型连接')
+                return
+            indices = self.edit_question_indices
+            turn_index = self.edit_question_turn
+            self.cancel_question_edit()
+            self.replace_question(turn_index, revised, indices)
+            return
         if self.multi_rows:
             indices = sorted(self.multi_rows)
             question = "\n".join(self.rows[i]["text"] for i in indices)
@@ -1103,7 +1141,7 @@ class App:
         self.chat.highlight(set())
 
     def select_question(self, question, indices):
-        if not self.qa.enabled or not question or not indices:
+        if not self.qa.enabled or not question:
             return
         if self.codex_connection.state not in ("authenticated", "verified"):
             self.qa_status.set(self.codex_connection.detail)
@@ -1117,6 +1155,8 @@ class App:
             return
         self.qa.reset()
         self.qa_selection = key
+        if self.auto_qa.get() and self.qa_question:
+            self.qa_display_history.append((self.qa_question, self.qa_answer))
         self.qa_question, self.qa_answer = question, self.qa_cache.get(key, "")
         self.render_qa()
         if self.qa_answer:
@@ -1126,39 +1166,153 @@ class App:
         self.qa_status.set("正在回答…")
         # Only the selected passage and its preceding context go to Codex.
         context = ([r["text"] for r in self.rows[max(0, indices[0]-8):indices[0]]]
-                   + [self.rows[i]["text"] for i in indices])
+                   + [self.rows[i]["text"] for i in indices]) if indices else [r["text"] for r in self.rows[-12:]]
         self.qa.ask(question, context)
         self.clear_question_selection()
 
+    def edit_question(self, event):
+        position = self.qa_text.index(f"@{event.x},{event.y}")
+        turn = next((tag for tag in self.qa_text.tag_names(position)
+                     if tag.startswith('question_turn:')), None)
+        if turn is None:
+            return
+        turns = self.qa_display_history + ([(self.qa_question, self.qa_answer)] if self.qa_question else [])
+        index = int(turn.split(':')[1])
+        if index >= len(turns):
+            return
+        question = turns[index][0]
+        if getattr(self, 'question_editor', None) is not None:
+            if index == self.edit_question_turn:
+                return 'break'
+            # Resolve the clicked turn before reflowing the previous editor.
+            self.cancel_question_edit(preserve=True)
+        self.edit_question_turn = index
+        self.edit_question_original = question
+        self.edit_question_indices = list(self.qa_selection[0]) if index == len(self.qa_display_history) and self.qa_selection else []
+        start, end = self.qa_text.tag_ranges(turn)
+        editor = self.question_editor = tk.Text(self.qa_text, wrap='word', undo=True,
+            font=(typography.UI_FAMILY, self.font_size.get()), bg=self.qa_text.cget('bg'),
+            fg=self.theme_color('#007ACC'), insertbackground=self.theme_color('#263044'),
+            relief='flat', bd=0, highlightthickness=0, padx=0, pady=4, height=3)
+        editor.insert('1.0', self.question_drafts.get((index, question), question))
+        self.qa_text.configure(state='normal')
+        self.qa_text.delete(start, end)
+        self.qa_text.window_create(start, window=editor, stretch=True)
+        self.qa_text.insert(f'{start}+1c', '\n')
+        self.qa_text.configure(state='disabled')
+        self.ask_selected_button.configure(text='发送修改后的问题')
+        def resize(event=None):
+            if not editor.winfo_exists():
+                return
+            pixels = max(80, self.qa_text.winfo_width()-48)
+            average = max(1, self.font_size.get() * .75)
+            editor.configure(width=max(8, int(pixels/average)))
+            editor.update_idletasks()
+            count = editor.count('1.0', 'end-1c', 'displaylines')
+            editor.configure(height=min(10, max(2, (count[0] if count else 0)+1)))
+        editor.bind('<KeyRelease>', resize)
+        editor.bind('<Control-Return>', lambda e: (self.ask_selected(), 'break')[1])
+        editor.bind('<Escape>', lambda e: (self.cancel_question_edit(), 'break')[1])
+        resize()
+        editor.focus_set()
+        editor.mark_set('insert', 'end-1c')
+        return 'break'
+
+    def replace_question(self, index, question, indices):
+        turns = self.qa_display_history + [(self.qa_question, self.qa_answer)]
+        if not 0 <= index < len(turns):
+            return
+        old = turns[index]
+        for i in range(len(self.qa_history)-1, -1, -1):
+            if tuple(self.qa_history[i]) == old:
+                self.qa_history[i] = (question, '')
+                break
+        self.qa_cache.clear()
+        self.qa_selection = None
+        if index < len(self.qa_display_history):
+            self.qa_display_history[index] = (question, '')
+        else:
+            self.qa_question, self.qa_answer = question, ''
+        context = ([r['text'] for r in self.rows[max(0, indices[0]-8):indices[0]]]
+                   + [self.rows[i]['text'] for i in indices]) if indices else [r['text'] for r in self.rows[-12:]]
+        self.qa.ask(question, context)
+        self.qa_replacement = (self.qa.generation, index, old)
+        self.clear_question_selection()
+        self.qa_status.set('正在回答…')
+        self.render_qa()
+
+    def cancel_question_edit(self, preserve=False):
+        editor = getattr(self, 'question_editor', None)
+        if editor is not None:
+            key = (self.edit_question_turn, self.edit_question_original)
+            if preserve:
+                self.question_drafts[key] = editor.get('1.0', 'end-1c')
+                if len(self.question_drafts) > 64:
+                    self.question_drafts.pop(next(iter(self.question_drafts)))
+            else:
+                self.question_drafts.pop(key, None)
+            self.question_editor = None
+            editor.destroy()
+            self.ask_selected_button.configure(text='发送所选')
+            self.render_qa()
+
     def render_qa(self, streaming=False):
-        self.answer_copy_button.configure(state="normal" if self.qa_answer else "disabled")
-        if self.qa_answer:
+        editor = getattr(self, 'question_editor', None)
+        editor_focused = editor is not None and self.root.focus_get() is editor
+        has_answer = bool(self.qa_answer or self.qa_display_history)
+        self.answer_copy_button.configure(state="normal" if has_answer else "disabled")
+        if has_answer:
             self.answer_copy_button.pack(side="right")
         else:
             self.answer_copy_button.pack_forget()
-        if self.qa_question:
+        if self.qa_question or self.qa_display_history:
             self.qa_placeholder.place_forget()
         else:
             self.qa_placeholder.place(relx=0.5, rely=0.42, anchor="center")
         self.qa_text.configure(state="normal")
         previous = self.qa_text.get("1.0", "end-1c")
-        current = self.qa_question + "\n" + self.qa_answer if self.qa_question else ''
-        if streaming and previous and current.startswith(previous):
-            follow = self.qa_text.yview()[1] >= 0.995
+        turns = self.qa_display_history + ([(self.qa_question, self.qa_answer)] if self.qa_question else [])
+        current = "\n\n".join(question + "\n" + answer for question, answer in turns)
+        if editor is not None and not 0 <= self.edit_question_turn < len(turns):
+            # A provider/conversation reset can remove the turn being edited.
+            editor.destroy()
+            self.question_editor = editor = None
+            editor_focused = False
+            self.ask_selected_button.configure(text='发送所选')
+        follow = editor is None and self.qa_text.yview()[1] >= 1.0 - 1e-6
+        # Preserve the visible text line, not a percentage of a growing document.
+        # A fixed fraction moves the viewport down as new answers are appended.
+        top_line = self.qa_text.index('@0,0')
+        if editor is None and streaming and previous and current.startswith(previous):
             self.qa_text.insert("end", current[len(previous):])
-            if follow:
-                self.qa_text.see("end")
         else:
+            if editor is not None:
+                # Detach before deleting text: otherwise Tk destroys the embedded
+                # editor, including its draft, cursor, selection and undo history.
+                self.qa_text.window_configure(str(editor), window='')
             self.qa_text.delete("1.0", "end")
-            if self.qa_question:
-                self.qa_text.insert("end", self.qa_question + "\n", "question")
-                self.qa_text.insert("end", self.qa_answer)
+            for index, (question, answer) in enumerate(turns):
+                if index:
+                    self.qa_text.insert("end", "\n\n")
+                if editor is not None and index == self.edit_question_turn:
+                    self.qa_text.window_create('end', window=editor, stretch=True)
+                    self.qa_text.insert('end', '\n')
+                else:
+                    self.qa_text.insert("end", question + "\n", ("question", f"question_turn:{index}"))
+                self.qa_text.insert("end", answer)
+        if follow:
+            self.qa_text.see('end')
+        else:
+            self.qa_text.yview(top_line)
         self.qa_text.configure(state="disabled")
+        if editor_focused:
+            editor.focus_set()
 
     def copy_answer(self):
-        if self.qa_answer:
+        if self.qa_answer or self.qa_display_history:
             self.root.clipboard_clear()
-            self.root.clipboard_append(self.qa_answer)
+            self.root.clipboard_append(self.qa_text.get("1.0", "end-1c")
+                                       if self.qa_display_history else self.qa_answer)
             self.answer_copy_button.configure(text="已复制")
             self.root.after(1500, lambda: self.answer_copy_button.configure(text="复制"))
 
@@ -1166,7 +1320,48 @@ class App:
         generation, state, payload = value
         if generation != self.qa.generation or not self.qa.enabled or self.closing:
             return
+        replacement = getattr(self, 'qa_replacement', None)
+        if replacement and replacement[0] == generation and state in ('thinking', 'partial', 'answer'):
+            if state == 'thinking':
+                self.qa_status.set('正在回答…')
+                return
+            _, index, old = replacement
+            if index < len(self.qa_display_history):
+                self.qa_display_history[index] = tuple(payload)
+            else:
+                self.qa_question, self.qa_answer = payload
+            self.render_qa()
+            if state == 'answer':
+                self.codex_connection.record()
+                for i in range(len(self.qa_history)-1, -1, -1):
+                    if tuple(self.qa_history[i]) == old or tuple(self.qa_history[i]) == (payload[0], ''):
+                        self.qa_history[i] = payload
+                        break
+                self.qa_status.set('')
+                if self.session:
+                    path = self.session.with_suffix('.qa.jsonl')
+                    try:
+                        records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
+                        record = dict(time=datetime.now().astimezone().isoformat(), question=payload[0], answer=payload[1])
+                        for i in range(len(records)-1, -1, -1):
+                            if (records[i].get('question'), records[i].get('answer')) == old:
+                                records[i] = record
+                                break
+                        else:
+                            records.append(record)
+                        temporary = path.with_suffix('.tmp')
+                        temporary.write_text(''.join(json.dumps(row, ensure_ascii=False)+'\n' for row in records), encoding='utf-8')
+                        temporary.replace(path)
+                    except (OSError, ValueError):
+                        self.qa_status.set('回答已显示，但保存失败；可复制回答')
+            return
         if state == "thinking":
+            if self.auto_qa.get():
+                self.qa_selection = None
+                if self.qa_question and (self.qa_question != payload or self.qa_answer):
+                    self.qa_display_history.append((self.qa_question, self.qa_answer))
+                self.qa_question, self.qa_answer = payload, ""
+                self.render_qa()
             self.qa_status.set("正在回答…")
         elif state == "partial":
             self.qa_question, self.qa_answer = payload
@@ -1177,7 +1372,6 @@ class App:
             if self.qa_selection is not None:
                 self.qa_cache[self.qa_selection] = self.qa_answer
             self.qa_history.append(payload)
-            self.qa_history = self.qa_history[-40:]
             self.render_qa(streaming=True)
             self.qa_status.set("")
             if self.session:
@@ -1189,8 +1383,12 @@ class App:
                     self.qa_status.set("回答已显示，但保存失败；可复制回答")
         elif state == "error":
             self.codex_connection.record(payload)
+            if self.auto_qa.get():
+                self.auto_qa.set(False)
+                self.qa.reset()
             self.qa_status.set(payload[:220])
         elif state == "done":
+            self.qa_replacement = None
             self.qa.active = False
             self.render_codex_connection()
 
@@ -1275,7 +1473,7 @@ class App:
                 else:
                     self.hotkey_hint.configure(text="快捷键不可用")
                     self.hotkey_hint.pack(side="left")
-                    self.hotkey_error.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+                    self.hotkey_error.grid(row=1, column=0, sticky="w", pady=(8, 0))
             elif kind == "level":
                 self.set_level(value)
             elif kind == "backlog":
@@ -1297,6 +1495,8 @@ class App:
                     self.engine.stop()
                     self.status.set(f"自动保存失败，请导出当前文字：{exc}")
                 self.append_row(len(self.rows) - 1, value)
+                if self.auto_qa.get():
+                    self.qa.feed(value["text"])
                 self.refresh_caption()
             elif kind == "error":
                 self.failed = True
@@ -1308,6 +1508,9 @@ class App:
                 self.set_level(0)
                 if not self.failed:
                     self.status.set(f"已停止 · {len(self.session_rows)} 段已保存")
+        if (self.auto_qa.get() and not self.closing
+                and self.codex_connection.state in ("authenticated", "verified")):
+            self.qa.tick()
         self.root.after(100, self.poll)
 
     def close(self):

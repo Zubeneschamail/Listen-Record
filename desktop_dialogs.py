@@ -1,6 +1,7 @@
 """Small, non-blocking desktop service dialogs."""
 import threading
 import tkinter as tk
+import typography
 from tkinter import ttk, messagebox
 from app_paths import DATA, LOGS, MODELS
 from version import VERSION
@@ -23,7 +24,7 @@ def dialog(app, title):
 def about(app):
     from updates import check_update, download_update, launch_installer_when_closed
     window = dialog(app, '关于闻录')
-    ttk.Label(window, text=f'闻录 {VERSION}', font=('Microsoft YaHei UI', 14)).pack(anchor='w')
+    ttk.Label(window, text=f'闻录 {VERSION}', font=(typography.UI_FAMILY, 14)).pack(anchor='w')
     ttk.Label(window, textvariable=app.codex_status).pack(anchor='w', pady=(8, 0))
     status = tk.StringVar(value='本地转写 · 数据保存在此电脑\n可在设置中切换问答模型并检查连接。')
     ttk.Label(window, textvariable=status, wraplength=420).pack(anchor='w', pady=12)
@@ -72,7 +73,7 @@ def model_manager(app):
         window.grab_set()
     app._model_window = window
     window.configure(bg='#f7f8fa')
-    ttk.Label(window, text='转录模型', font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor='w')
+    ttk.Label(window, text='转录模型', font=(typography.UI_FAMILY, 12, 'bold')).pack(anchor='w')
     ttk.Label(window, text='统一下载和切换；下载完成后可离线使用。').pack(anchor='w', pady=(6, 0))
     names = ['small', 'large-v3-turbo', 'base', 'tiny']
     def model_labels():
@@ -217,7 +218,7 @@ def model_manager(app):
 
     button = tk.Button(window, text='下载模型', command=start, bg='#007ACC', fg='white',
                        activebackground='#006BB3', activeforeground='white', relief='flat',
-                       bd=0, padx=18, pady=7, font=('Microsoft YaHei UI', 9))
+                       bd=0, padx=18, pady=7, font=(typography.UI_FAMILY, 9))
     button.pack(anchor='e', pady=(14, 0))
     choice.bind('<<ComboboxSelected>>', refresh)
     window.protocol('WM_DELETE_WINDOW', close)

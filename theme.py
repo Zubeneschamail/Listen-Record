@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 
 PALETTE = {
+    '#e3e9f0': '#303D50',
     '#15803d': '#4ADE80', '#2563eb': '#60A5FA',
     '#b45309': '#FBBF24', '#b91c1c': '#F87171',
     'white': '#1C2430', '#ffffff': '#1C2430', '#f7f8fa': '#141B25',
@@ -35,7 +36,14 @@ def apply(root, dark):
         style.configure(name, background=bg)
     style.configure('TLabel', foreground=color('#858b98', dark))
     style.configure('TCheckbutton', foreground=fg)
+    style.configure('Settings.TNotebook', background=bg, borderwidth=0)
+    style.configure('Settings.TNotebook.Tab', background=bg, foreground=fg,
+                    padding=(14, 9), borderwidth=0)
+    style.map('Settings.TNotebook.Tab', background=[('selected', surface), ('active', color('#E6F2FB', dark))],
+              foreground=[('selected', '#007ACC')])
     style.map('TCheckbutton', background=[('active', color('#E6F2FB', dark))])
+    from checkbox_style import apply as apply_checkboxes
+    apply_checkboxes(root, style, dark)
     style.configure('TButton', background=surface, foreground=fg)
     style.map('TButton', background=[('active', color('#E6F2FB', dark))],
               foreground=[('disabled', color('#a6acba', dark))])

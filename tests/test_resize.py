@@ -8,6 +8,64 @@ from chat_view import Bubble
 
 
 class ResizeTests(unittest.TestCase):
+    def test_drag_across_zero_keeps_absolute_screen_coordinates(self):
+        root = tk.Tk()
+        root.overrideredirect(True)
+        try:
+            root.geometry('640x400+20+30')
+            root.update()
+            app = App.__new__(App)
+            app.root = root
+            app._drag_origin = (50, 40)
+            for x, y in ((1, 2), (-1, -2), (-200, -30), (20, 30)):
+                app.drag_move(SimpleNamespace(x_root=x+50, y_root=y+40))
+                root.update()
+                self.assertEqual((root.winfo_rootx(), root.winfo_rooty()), (x, y))
+        finally:
+            root.destroy()
+
+    def test_resize_preview_and_commit_use_absolute_negative_coordinates(self):
+        app = App.__new__(App)
+        app.root = Mock()
+        app._resize_origin = (100, 100, 640, 400)
+        app._resize_position = (20, 30)
+        app._resize_edge = 'nw'
+        preview = app._resize_preview = Mock()
+        event = SimpleNamespace(x_root=50, y_root=50)
+        app.resize_move(event)
+        preview.geometry.assert_called_with('690x450+-30+-20')
+        app.flush_resize(event)
+        app.root.geometry.assert_called_once_with('690x450+-30+-20')
+
+    def test_all_edges_keep_opposite_edge_fixed_until_release(self):
+        expected = {'n': '640x370+20+60', 's': '640x430',
+                    'w': '600x400+60+30', 'e': '680x400',
+                    'nw': '600x370+60+60', 'ne': '680x370+20+60',
+                    'sw': '600x430+60+30', 'se': '680x430'}
+        for edge, geometry in expected.items():
+            with self.subTest(edge=edge):
+                app = App.__new__(App)
+                app.root = Mock()
+                app._resize_origin = (100, 100, 640, 400)
+                app._resize_position = (20, 30)
+                app._resize_edge = edge
+                app._resize_preview = Mock()
+                event = SimpleNamespace(x_root=140, y_root=130)
+                app.resize_move(event)
+                app.root.geometry.assert_not_called()
+                app.flush_resize(event)
+                app.root.geometry.assert_called_once_with(geometry)
+
+    def test_top_left_resize_clamps_minimum_size(self):
+        app = App.__new__(App)
+        app.root = Mock()
+        app._resize_origin = (100, 100, 640, 400)
+        app._resize_position = (20, 30)
+        app._resize_edge = 'nw'
+        app._resize_preview = Mock()
+        app.flush_resize(SimpleNamespace(x_root=1100, y_root=1100))
+        app.root.geometry.assert_called_once_with('420x280+240+150')
+
     def test_drag_only_updates_outline_and_release_commits_latest_size(self):
         app = App.__new__(App)
         app.root = Mock()

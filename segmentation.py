@@ -28,6 +28,7 @@ class PauseSegmenter:
         self.start = self.epoch = 0.0
         self.overlapping = False
         self.since_check = 0
+        self.last_speech_end = None
 
     @staticmethod
     def detect(audio):
@@ -59,6 +60,8 @@ class PauseSegmenter:
         self.since_check = 0
         while len(self.audio):
             ranges = self.detector(self.audio)
+            if ranges:
+                self.last_speech_end = self.start + ranges[-1]['end'] / RATE
             if not ranges:
                 if not self.overlapping:
                     # Preserve a little pre-roll for consonants at the next speech onset.

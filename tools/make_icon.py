@@ -1,38 +1,17 @@
-"""Build PNG/Windows ICO assets from the same geometric design as logo.svg.
-
-Development-only dependency: Pillow. The app itself does not need Pillow.
-"""
+"""Build app PNG/Windows ICO assets from the supplied full-resolution artwork."""
 from pathlib import Path
 from io import BytesIO
 import struct
-from PIL import Image, ImageDraw
+from PIL import Image
 
 assets = Path(__file__).resolve().parents[1] / "assets"
 assets.mkdir(exist_ok=True)
-accent = "#007ACC"
+source = Image.open(assets / 'logo-source.png').convert('RGBA')
 
 
 def render(size):
-    # Render each target size independently. Integer-aligned straight edges and
-    # thicker small-size bars avoid the blur from repeatedly downsampling a 256px icon.
-    scale = 4
-    canvas = Image.new("RGBA", (size * scale, size * scale))
-    draw = ImageDraw.Draw(canvas)
-    def rounded(box, radius, color):
-        x0, y0, x1, y1 = (v * scale for v in box)
-        draw.rounded_rectangle((x0, y0, x1-1, y1-1), radius=radius*scale, fill=color)
-    rounded((0, 0, size, size), max(3, round(size*.22)), accent)
-    left, top = round(size*.18), round(size*.18)
-    right, bottom = round(size*.82), round(size*.72)
-    draw.polygon([(left*scale, round(size*.59)*scale),
-                  (left*scale, round(size*.84)*scale),
-                  (round(size*.43)*scale, round(size*.64)*scale)], fill="white")
-    rounded((left, top, right, bottom), max(2, round(size*.14)), "white")
-    width = max(2, round(size*.065))
-    for center, y0, y1 in [(.34, .37, .55), (.5, .28, .64), (.66, .34, .58)]:
-        x = round(size*center)-width//2
-        rounded((x, round(size*y0), x+width, round(size*y1)), width/2, accent)
-    return canvas.resize((size, size), Image.Resampling.BOX)
+    # Always resample from the original; avoid successive resizing losses.
+    return source.resize((size, size), Image.Resampling.LANCZOS)
 
 
 for size in (24, 32, 256):
@@ -51,4 +30,4 @@ for size, payload in zip(sizes, payloads):
     directory.append(struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(payload), offset))
     offset += len(payload)
 (assets / "wenlu.ico").write_bytes(struct.pack("<HHH", 0, 1, len(sizes)) + b"".join(directory) + b"".join(payloads))
-print("Created pixel-fitted PNGs and ten-size Windows icon")
+print("Created PNGs and ten-size Windows icon from supplied artwork")

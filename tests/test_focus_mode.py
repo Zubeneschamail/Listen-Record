@@ -18,6 +18,15 @@ class FocusModeTests(unittest.TestCase):
                     app.toggle_qa()
                     root.update()
                     original = root.geometry()
+                    self.assertEqual(app.qa_header.cget('cursor'), '')
+                    # Content surfaces must not move the normal window, even
+                    # when a previous title-bar drag left an origin behind.
+                    app._drag_origin = (0, 0)
+                    for surface in (app.qa_header, app.chat.canvas, app.chat.inner):
+                        surface.event_generate('<ButtonPress-1>', x=5, y=5, rootx=100, rooty=100)
+                        surface.event_generate('<B1-Motion>', x=35, y=25, rootx=130, rooty=120)
+                        root.update()
+                        self.assertEqual(root.geometry(), original)
                     panes = len(app.columns.panes())
                     root.focus_force()
                     root.event_generate('<F11>')
@@ -27,7 +36,7 @@ class FocusModeTests(unittest.TestCase):
                     self.assertEqual(root.geometry(), original)
                     self.assertEqual(app.columns.winfo_width(), root.winfo_width())
                     self.assertEqual(app.columns.winfo_height(), root.winfo_height())
-                    self.assertTrue(app.resize_grip.winfo_ismapped())
+                    self.assertTrue(app.resize_handles['se'].winfo_ismapped())
                     for widget in (app.header, app.controls, app.status_label):
                         self.assertFalse(widget.winfo_ismapped())
                     root.event_generate('<Escape>')
@@ -36,7 +45,7 @@ class FocusModeTests(unittest.TestCase):
                     self.assertEqual(root.geometry(), original)
                     self.assertEqual(len(app.columns.panes()), panes)
                     self.assertFalse(app.status_label.winfo_ismapped())
-                    for widget in (app.header, app.controls, app.resize_grip):
+                    for widget in (app.header, app.controls, app.resize_handles['se']):
                         self.assertTrue(widget.winfo_ismapped())
                 app.toggle_focus_mode()
                 root.update()
@@ -45,7 +54,7 @@ class FocusModeTests(unittest.TestCase):
                 app.qa_header.event_generate('<B1-Motion>', x=35, y=25, rootx=x+35, rooty=y+25)
                 root.update()
                 self.assertEqual((root.winfo_rootx(), root.winfo_rooty()), (x+30, y+20))
-                grip = app.resize_grip
+                grip = app.resize_handles['se']
                 grip.event_generate('<ButtonPress-1>', x=2, y=2, rootx=650, rooty=450)
                 grip.event_generate('<B1-Motion>', x=42, y=32, rootx=690, rooty=480)
                 root.update()
