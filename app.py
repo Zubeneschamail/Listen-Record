@@ -28,7 +28,7 @@ from paragraphs import ParagraphAssembler
 from recognition import RecognitionContext, read_preferences, save_preferences
 from scrollbars import SlimScrollbar
 from chat_view import ChatView
-from ui_components import UIControls, ToggleChip
+from ui_components import UIControls, ToggleChip, SplitterHandle
 from settings_view import build_settings
 from audio_levels import AudioLevelNormalizer
 from model_runtime import load_model
@@ -339,13 +339,13 @@ class App:
         root.option_add("*TCombobox*Listbox.relief", "flat")
         style.configure("Slim.Horizontal.TProgressbar", background="#007ACC", troughcolor="#edf0f7",
                         borderwidth=0, thickness=2)
-        frame = self.main_frame = ttk.Frame(root, padding=(12, 8, 12, 12))
+        frame = self.main_frame = ttk.Frame(root, padding=0)
         frame.pack(fill="both", expand=True, padx=1, pady=1)
 
         button = UIControls(self).button
 
-        header = self.header = ttk.Frame(frame)
-        header.pack(fill="x", pady=(0, 8))
+        header = self.header = ttk.Frame(frame, padding=(12, 6, 12, 6))
+        header.pack(fill="x")
         self.brand_image = tk.PhotoImage(file=str(ROOT / "assets" / "logo-24.png"))
         brand = ttk.Label(header, image=self.brand_image)
         brand.pack(side="left", padx=(0, 7))
@@ -372,7 +372,7 @@ class App:
         controls = self.controls = ttk.Frame(header)
         controls.pack(side="right", padx=(0, 6))
         self.footer = tk.StringVar(value="自动保存")
-        self.storage_hint = tk.StringVar(value="自动保存")
+        self.storage_hint = tk.StringVar(value="")
         ttk.Label(controls, textvariable=self.storage_hint, font=(typography.UI_FAMILY, 8), foreground="#a0a6b2").pack(side="right", padx=8)
         self.resize_handles = {}
         edges = {
@@ -397,12 +397,12 @@ class App:
         self.status_label = ttk.Label(self.body, textvariable=self.status, wraplength=510)
         self.level = tk.Canvas(self.body, height=2, bg="#edf0f7", bd=0, highlightthickness=0)
         self.level_bar = self.level.create_rectangle(0, 0, 0, 2, fill="#007ACC", outline="")
-        self.columns = tk.PanedWindow(self.body, orient="horizontal", bg="#f7f8fa",
-                                      bd=0, sashwidth=7, sashrelief="flat", showhandle=False,
+        self.columns = tk.PanedWindow(self.body, orient="horizontal", bg="#E3E9F0",
+                                      bd=0, sashwidth=1, sashrelief="flat", showhandle=False,
                                       opaqueresize=False, proxybackground="#007ACC",
                                       proxyborderwidth=0, proxyrelief="flat")
         self.columns.pack(fill="both", expand=True)
-        self.left_panel = tk.Frame(self.columns, bg="white", highlightbackground="#E3E9F0", highlightcolor="#E3E9F0", highlightthickness=1)
+        self.left_panel = tk.Frame(self.columns, bg="white", bd=0, highlightthickness=0)
         self.copy_button = button(self.left_panel, "复制全文", self.copy)
         self.columns.add(self.left_panel, minsize=150, stretch="always")
         self.text = tk.Text(self.left_panel, wrap="word", font=(typography.UI_FAMILY, 10),
@@ -424,7 +424,10 @@ class App:
         self.text.tag_configure("qa_selected", background="#E6F2FB", foreground="#007ACC")
         self.text.bind("<ButtonPress-1>", self.question_press)
         self.text.bind("<ButtonRelease-1>", self.question_release)
-        self.qa_panel = tk.Frame(self.columns, bg="white", highlightbackground="#E3E9F0", highlightcolor="#E3E9F0", highlightthickness=1)
+        self.qa_panel = tk.Frame(self.columns, bg="white", bd=0, highlightthickness=0)
+        self.splitter_handle = SplitterHandle(self.columns)
+        for panel in (self.left_panel, self.qa_panel):
+            panel.bind('<Configure>', self.splitter_handle.position, add='+')
         qa_header = self.qa_header = tk.Frame(self.qa_panel, bg="white", padx=12, pady=5)
         qa_header.pack(fill="x")
         tk.Label(qa_header, textvariable=self.qa_provider_name, bg="white", fg="#737b8c", font=(typography.UI_FAMILY, 9, "bold")).pack(side="left")
@@ -511,9 +514,9 @@ class App:
             return
         self.focus_mode = False
         view = self._normal_view
-        self.main_frame.configure(padding=(12, 8, 12, 12))
+        self.main_frame.configure(padding=0)
         self.main_frame.pack_configure(padx=1, pady=1)
-        self.header.pack(fill='x', pady=(0, 8), before=self.body)
+        self.header.pack(fill='x', before=self.body)
         for handle in self.resize_handles.values():
             handle.lift()
         if not view['qa']:
@@ -797,7 +800,7 @@ class App:
     def set_busy(self, busy):
         self.busy = busy
         if not busy:
-            self.storage_hint.set("自动保存")
+            self.storage_hint.set("")
         self.hotwords_entry.configure(state="disabled" if busy else "normal")
         for widget in (self.device, self.microphone, self.mode, self.model, self.language):
             widget.configure(state="disabled" if busy else "readonly")
@@ -929,6 +932,7 @@ class App:
         else:
             self.columns.forget(self.qa_panel)
             self.qa_status.set("问答已关闭")
+        self.splitter_handle.position()
 
     def toggle_auto_shortcut(self, event=None):
         if self.closing or self.root.grab_current():
@@ -1477,7 +1481,7 @@ class App:
             elif kind == "level":
                 self.set_level(value)
             elif kind == "backlog":
-                self.storage_hint.set(f"积压 {value:.0f}s" if value >= 2 else "自动保存")
+                self.storage_hint.set(f"积压 {value:.0f}s" if value >= 2 else "")
                 self.footer.set(f"积压 {value:.0f}s · {len(self.session_rows)} 段" if value >= 2 else f"已保存 {len(self.session_rows)} 段")
             elif kind == "preview":
                 self.show_preview(value)

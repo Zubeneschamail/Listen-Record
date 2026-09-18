@@ -155,6 +155,64 @@ class PopupMenu(tk.Toplevel):
         return 'break'
 
 
+class SplitterHandle(tk.Canvas):
+    """Wide pointer target over a one-pixel sash; commit layout on release."""
+    _custom_theme = True
+
+    def __init__(self, panes):
+        super().__init__(panes, width=13, bd=0, highlightthickness=0,
+                         bg='white', cursor='sb_h_double_arrow')
+        self.panes, self.drag = panes, None
+        self.line = self.create_line(6, 0, 6, 10000, fill='#E3E9F0')
+        self.bind('<ButtonPress-1>', self.begin)
+        self.bind('<B1-Motion>', self.move)
+        self.bind('<ButtonRelease-1>', self.end)
+        self.bind('<Escape>', self.cancel)
+        panes.bind('<Configure>', self.position, add='+')
+
+    def apply_theme(self, dark):
+        self.configure(bg=color('white', dark))
+        self.itemconfigure(self.line, fill=color('#E3E9F0', dark))
+
+    def position(self, event=None):
+        if len(self.panes.panes()) != 2:
+            self.place_forget()
+            return
+        self.place(x=self.panes.sash_coord(0)[0]-6, y=0, width=13, relheight=1, bordermode='ignore')
+        tk.Misc.lift(self)
+
+    def begin(self, event):
+        self.drag = (self.panes.sash_coord(0)[0], event.x_root)
+        self.target = self.drag[0]
+        self.focus_set()
+        self.grab_set()
+        return 'break'
+
+    def move(self, event):
+        if self.drag:
+            panes = self.panes.panes()
+            minimum = int(self.panes.panecget(panes[0], 'minsize'))
+            maximum = self.panes.winfo_width() - int(self.panes.panecget(panes[1], 'minsize')) - 1
+            self.target = max(minimum, min(maximum, self.drag[0] + event.x_root - self.drag[1]))
+            self.panes.proxy_place(self.target, 0)
+        return 'break'
+
+    def end(self, event):
+        if self.drag:
+            self.move(event)
+            self.panes.sash_place(0, self.target, 0)
+            self.cancel()
+            self.position()
+        return 'break'
+
+    def cancel(self, event=None):
+        self.drag = None
+        self.panes.proxy_forget()
+        if self.grab_current() is self:
+            self.grab_release()
+        return 'break'
+
+
 class ScrollPage(ttk.Frame):
     """A themed, independently scrolling settings page."""
     def __init__(self, parent):

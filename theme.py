@@ -62,6 +62,10 @@ def apply(root, dark):
         root.option_add('*TCombobox*Listbox.' + option, value)
 
     def visit(widget):
+        if isinstance(widget, (tk.Tk, tk.Toplevel)):
+            # Child dialogs must expose the same theme state as the main window;
+            # their controls use it again when selection/hover changes later.
+            widget._dark_theme = dark
         if getattr(widget, '_custom_theme', False):
             widget.apply_theme(dark)
             return
