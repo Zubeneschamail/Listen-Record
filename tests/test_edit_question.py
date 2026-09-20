@@ -7,12 +7,12 @@ from app import App
 
 class EditQuestionTests(unittest.TestCase):
     def test_switch_questions_preserves_drafts_and_sends_selected_turn(self):
-        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('codex_connection.CodexConnection.check'):
+        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('qa_connection.QAConnection.check'):
             root = tk.Tk()
             app = App(root)
         try:
             app.open_qa()
-            app.codex_connection.state = 'verified'
+            app.qa_connection.state = 'verified'
             app.qa_display_history = [('第一问题', '第一回复')]
             app.qa_question, app.qa_answer = '第二问题', '第二回复'
             app.render_qa()
@@ -45,14 +45,14 @@ class EditQuestionTests(unittest.TestCase):
             self.assertNotIn((1, '第二问题'), app.question_drafts)
         finally:
             app.qa.set_enabled(False)
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.hotkey.close()
             for timer in root.tk.call('after', 'info'):
                 root.after_cancel(timer)
             root.destroy()
 
     def test_auto_history_replacement_stays_in_original_position(self):
-        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('codex_connection.CodexConnection.check'):
+        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('qa_connection.QAConnection.check'):
             root = tk.Tk()
             app = App(root)
         try:
@@ -77,19 +77,19 @@ class EditQuestionTests(unittest.TestCase):
             self.assertEqual(len(app.qa_display_history), 2)
         finally:
             app.qa.set_enabled(False)
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.hotkey.close()
             for timer in root.tk.call('after', 'info'):
                 root.after_cancel(timer)
             root.destroy()
 
     def test_edit_and_resubmit_without_transcript_selection(self):
-        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('codex_connection.CodexConnection.check'):
+        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('qa_connection.QAConnection.check'):
             root = tk.Tk()
             app = App(root)
         try:
             app.open_qa()
-            app.codex_connection.state = 'verified'
+            app.qa_connection.state = 'verified'
             app.qa_question, app.qa_answer = '原问题', '原回答'
             app.render_qa()
             root.update()
@@ -109,20 +109,26 @@ class EditQuestionTests(unittest.TestCase):
                 self.assertIs(app.question_editor, editor)
                 self.assertIn('后台新增回答', app.qa_text.get('1.0', 'end-1c'))
                 editor.insert('1.0', '修改后的专业问题')
-                send.invoke()
+                root.focus_force()
+                editor.focus_set()
+                root.update()
+                editor.event_generate('<Control-Return>')
+                self.assertEqual(editor.get('1.0', 'end-1c'), '修改后的专业问题\n')
+                ask.assert_not_called()
+                editor.event_generate('<Return>')
                 ask.assert_called_once_with('修改后的专业问题', [])
             self.assertEqual(app.qa_question, '修改后的专业问题')
             self.assertIsNone(root.grab_current())
         finally:
             app.qa.set_enabled(False)
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.hotkey.close()
             for timer in root.tk.call('after', 'info'):
                 root.after_cancel(timer)
             root.destroy()
 
     def test_auto_updates_while_preserving_unsent_editor(self):
-        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('codex_connection.CodexConnection.check'):
+        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('qa_connection.QAConnection.check'):
             root = tk.Tk()
             app = App(root)
         try:
@@ -154,7 +160,7 @@ class EditQuestionTests(unittest.TestCase):
             self.assertIn('第二问题', app.qa_text.get('1.0', 'end-1c'))
         finally:
             app.qa.set_enabled(False)
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.hotkey.close()
             for timer in root.tk.call('after', 'info'):
                 root.after_cancel(timer)

@@ -8,7 +8,7 @@ import time
 import unittest
 
 import httpx
-from codex_qa import CodexQA, make_prompt
+from qa_worker import QAWorker, make_prompt
 from qa_provider import APIProvider, endpoint, load_settings, save_settings
 
 
@@ -94,13 +94,18 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn('secret-', path.read_text(encoding='utf-8'))
             self.assertEqual(load_settings(path), settings)
             data = json.loads(path.read_text(encoding='utf-8'))
+            # Retired providers fall back to DeepSeek without losing saved API profiles.
+            data['provider'] = 'retired-provider'
+            data['profiles']['retired-provider'] = {'model': 'old'}
+            path.write_text(json.dumps(data), encoding='utf-8')
+            self.assertEqual(load_settings(path), settings)
             data['profiles']['deepseek']['encrypted_key'] = 'invalid'
             path.write_text(json.dumps(data), encoding='utf-8')
             self.assertEqual(load_settings(path)['profiles']['deepseek']['api_key'], '')
 
     def test_stream_worker_emits_partial_and_discards_cancelled_completion(self):
         events = queue.Queue()
-        qa = CodexQA(events)
+        qa = QAWorker(events)
         started, release = threading.Event(), threading.Event()
         def stream(prompt, cancel, partial):
             partial('draft')

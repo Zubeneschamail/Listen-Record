@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 folder = Path(__file__).resolve().parents[1] / 'assets' / 'icons'
 folder.mkdir(exist_ok=True)
 scale = 4
-for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check', 'send', 'microphone', 'microphone-active', 'waveform', 'add'):
+for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check', 'send', 'microphone', 'microphone-active', 'waveform', 'add', 'auto', 'collapse'):
     size = 24 if name in ('send', 'microphone', 'microphone-active', 'refresh', 'waveform', 'add') else 20
     im = Image.new('RGBA', (size*scale,size*scale))
     d = ImageDraw.Draw(im)
@@ -50,11 +50,11 @@ for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check'
     elif name == 'more':
         for x in (4,10,16):
             d.ellipse(((x-1)*scale,9*scale,(x+1)*scale,11*scale),fill=color)
-    elif name in ('refresh', 'waveform', 'add'):
+    elif name in ('refresh', 'waveform', 'add', 'auto', 'collapse'):
         # Sample the original SVG's cubic Beziers (M/L/V/C paths) directly.
         unit = size*scale/48
         for path in ET.parse(folder / f'{name}.svg').getroot():
-            tokens = iter(re.findall(r'[MLVCZ]|-?\d+(?:\.\d+)?', path.attrib['d']))
+            tokens = iter(re.findall(r'[MLHVCZ]|-?\d+(?:\.\d+)?', path.attrib['d']))
             strokes, points = [], []
             for command in tokens:
                 if command == 'M':
@@ -65,6 +65,8 @@ for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check'
                     points.append((float(next(tokens)), float(next(tokens))))
                 elif command == 'V':
                     points.append((points[-1][0], float(next(tokens))))
+                elif command == 'H':
+                    points.append((float(next(tokens)), points[-1][1]))
                 elif command == 'Z':
                     points.append(points[0])
                 elif command == 'C':

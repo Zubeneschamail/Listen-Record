@@ -25,7 +25,8 @@ def about(app):
     from updates import check_update, download_update, launch_installer_when_closed
     window = dialog(app, '关于闻录')
     ttk.Label(window, text=f'闻录 {VERSION}', font=(typography.UI_FAMILY, 14)).pack(anchor='w')
-    ttk.Label(window, textvariable=app.codex_status).pack(anchor='w', pady=(8, 0))
+    from ui_components import StatusIndicator
+    StatusIndicator(window, app.connection_status, app.qa_detection_state).pack(anchor='w', pady=(8, 0))
     status = tk.StringVar(value='本地转写 · 数据保存在此电脑\n可在设置中切换问答模型并检查连接。')
     ttk.Label(window, textvariable=status, wraplength=420).pack(anchor='w', pady=12)
     ttk.Button(window, text='打开日志目录', command=lambda: app.open_folder(LOGS)).pack(anchor='w')
@@ -59,7 +60,7 @@ def about(app):
     button.pack(anchor='e', pady=(16, 0))
 
 
-def model_manager(app):
+def model_manager(app, on_close=None):
     import multiprocessing as mp
     import time
     from model_download import cached_model, download_worker, BUNDLED_MODELS, progress_text
@@ -86,6 +87,8 @@ def model_manager(app):
         return result
     choice = ttk.Combobox(window, values=model_labels(),
                           state='readonly', width=34, style='Settings.TCombobox')
+    from ui_components import guard_combo_wheel
+    guard_combo_wheel(choice)
     choice.current(names.index(app.model.get().split()[0]))
     choice.pack(fill='x', pady=12)
     status = tk.StringVar()
@@ -215,6 +218,8 @@ def model_manager(app):
         window.destroy()
         if app.settings_window.winfo_viewable():
             app.settings_window.grab_set()
+        if on_close:
+            app.root.after_idle(on_close)
 
     button = tk.Button(window, text='下载模型', command=start, bg='#007ACC', fg='white',
                        activebackground='#006BB3', activeforeground='white', relief='flat',

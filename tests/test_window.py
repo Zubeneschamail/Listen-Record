@@ -28,7 +28,7 @@ class WindowFlowTests(unittest.TestCase):
                 self.assertEqual(region[-1], app.chat.canvas.bbox('all')[-1])
                 self.assertTrue(app.chat.inner.winfo_ismapped())
         finally:
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.qa.set_enabled(False)
             app.hotkey.close()
             for identifier in root.tk.call('after', 'info'):
@@ -63,7 +63,7 @@ class WindowFlowTests(unittest.TestCase):
             self.assertEqual(bubble.text.get('1.0', 'end-1c'), '已有对话')
             self.assertEqual(draft.text.cget('bg'), '#F0F1F3')
         finally:
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.qa.set_enabled(False)
             app.hotkey.close()
             for identifier in root.tk.call('after', 'info'):
@@ -74,10 +74,10 @@ class WindowFlowTests(unittest.TestCase):
         tray = patch('app.App.start_tray', return_value=True)
         tray.start()
         self.addCleanup(tray.stop)
-        config = patch('app.load_settings', return_value={'provider': 'codex', 'profiles': {}})
+        config = patch('app.load_settings', return_value={'provider': 'compatible', 'profiles': {}})
         config.start()
         self.addCleanup(config.stop)
-        preflight = patch('codex_connection.CodexConnection.check',
+        preflight = patch('qa_connection.QAConnection.check',
                           lambda connection, probe=False: connection._publish(
                               connection.revision, 'authenticated', 'Test login ready'))
         preflight.start()
@@ -119,7 +119,7 @@ class WindowFlowTests(unittest.TestCase):
                 process.terminate.assert_called_once()
                 self.assertFalse(progress.winfo_ismapped())
         finally:
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.qa.set_enabled(False)
             app.hotkey.close()
             for identifier in root.tk.call('after', 'info'):
@@ -134,28 +134,25 @@ class WindowFlowTests(unittest.TestCase):
         try:
             app.open_qa()
             old_generation, cancel = app.qa.generation, app.qa.cancel
-            app.qa_cache['previous'] = 'old answer'
             app.qa_settings = {'provider': 'deepseek', 'profiles': {}}
             app.configure_qa_provider()
             self.assertTrue(cancel.is_set())
-            self.assertEqual(app.qa_cache, {})
             self.assertEqual(app.qa_provider_name.get(), 'DeepSeek')
             self.assertIsNotNone(app.qa.stream_runner)
-            self.assertEqual(app.codex_connection.login()[0], 'unauthenticated')
+            self.assertEqual(app.qa_connection.preflight()[0], 'unauthenticated')
             app.handle_qa((old_generation, 'partial', ('old question', 'stale')))
             self.assertEqual(app.qa_answer, '')
             app.handle_qa((app.qa.generation, 'partial', ('question', 'partial')))
             self.assertEqual(app.qa_answer, 'partial')
             self.assertEqual(app.qa_history, [])
-            self.assertEqual(app.qa_cache, {})
             app.handle_qa((app.qa.generation, 'answer', ('question', 'partial final')))
             self.assertEqual(app.qa_text.get('1.0', 'end-1c'), 'question\npartial final')
-            app.qa_settings['provider'] = 'codex'
+            app.qa_settings['provider'] = 'compatible'
             app.configure_qa_provider()
-            self.assertIsNone(app.qa.stream_runner)
+            self.assertIsNotNone(app.qa.stream_runner)
             self.assertEqual(app.qa_answer, '')
         finally:
-            app.codex_connection.close()
+            app.qa_connection.close()
             app.qa.set_enabled(False)
             app.hotkey.close()
             for identifier in root.tk.call('after', 'info'):
@@ -218,16 +215,16 @@ class WindowFlowTests(unittest.TestCase):
             self.assertEqual(root.grab_current(), app.settings_window)
             app.settings_tabs.select(app.settings_pages['ai'])
             root.update()
-            with patch.object(app.codex_connection, 'check') as check:
-                app.codex_check_button.invoke()
+            with patch.object(app.qa_connection, 'check') as check:
+                app.connection_check_button.invoke()
                 check.assert_called_once_with(probe=True)
-            app.codex_connection.record()
+            app.qa_connection.record()
             app.poll()
-            self.assertIn('响应正常', app.codex_status.get())
-            self.assertTrue(app.codex_check_button.winfo_viewable())
+            self.assertIn('响应正常', app.connection_status.get())
+            self.assertTrue(app.connection_check_button.winfo_viewable())
             app.model.current(1)
             app.hotwords.set("大模型,闻录")
-            app.hide_settings()
+            app.settings_save_button.invoke()
             root.update()
             self.assertIsNone(root.grab_current())
             self.assertFalse(app.settings_window.winfo_viewable())
@@ -239,11 +236,8 @@ class WindowFlowTests(unittest.TestCase):
             root.update()
             self.assertEqual(app.settings_window.winfo_height(), 440)
             tools_page = app.settings_pages['tools']
-            self.assertEqual(tools_page.scrollbar.winfo_manager(), 'place')
-            tools_page.canvas.yview_moveto(1)
-            root.update()
-            self.assertGreater(tools_page.canvas.yview()[0], 0)
-            self.assertEqual(len(app.settings_actions), 7)
+            self.assertEqual(tools_page.canvas.yview()[0], 0)
+            self.assertEqual(set(app.settings_actions), {'导出记录', '历史记录', '关于与更新'})
             for action in app.settings_actions.values():
                 self.assertTrue(action.winfo_viewable())
             with patch.object(app, 'open_folder') as folder:
@@ -252,7 +246,7 @@ class WindowFlowTests(unittest.TestCase):
             self.assertIsNone(root.grab_current())
             self.assertFalse(app.settings_visible)
             app.toggle_settings()
-            app.settings_tabs.select(app.settings_pages['ai'])
+            app.settings_tabs.select(app.settings_pages['appearance'])
             app.pin_button.invoke()
             self.assertTrue(app.pinned)
             self.assertEqual(app.pin_button.cget('text'), '取消置顶')
@@ -338,7 +332,7 @@ class WindowFlowTests(unittest.TestCase):
                 app.qa.ask.assert_called_once_with("第一问？\n第三问？", ["第一问？", "第三问？"])
                 self.assertFalse(app.multi_rows)
                 self.assertIsNone(app.bubble_selection)
-                self.assertEqual(app.ask_selected_button.cget("text"), "发送所选")
+                self.assertEqual(app.ask_selected_button.cget("text"), "发送")
                 self.assertFalse(any(b.selected for b in app.chat.bubbles.values()))
                 self.assertFalse(app.text.tag_ranges("qa_selected"))
                 old = app.qa.generation
@@ -438,7 +432,7 @@ class WindowFlowTests(unittest.TestCase):
                 root.after_cancel(identifier)
             root.destroy()
 
-    def test_click_selection_replaces_question_and_uses_cache(self):
+    def test_click_selection_replaces_request_and_uses_fresh_context(self):
         from unittest.mock import Mock
         with patch("app.GlobalHotkey"):
             root = tk.Tk()
@@ -465,7 +459,7 @@ class WindowFlowTests(unittest.TestCase):
                 self.assertIn("训练答案", app.qa_text.get("1.0", "end"))
                 app.qa.ask.reset_mock()
                 app.select_question("如何训练？", [2])
-                app.qa.ask.assert_not_called()
+                app.qa.ask.assert_called_once_with('如何训练？', ['这是背景。', '什么是模型？', '如何训练？'])
                 app.text.tag_add("sel", "1.0", app.text.tag_ranges("body:2")[-1])
                 app.ask_selected()
                 self.assertEqual(app.qa.ask.call_args.args[0], "这是背景。\n什么是模型？\n如何训练？")

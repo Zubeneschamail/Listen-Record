@@ -2,10 +2,10 @@ import json
 import queue
 import threading
 import unittest
-from codex_qa import CodexQA, command, is_question
+from qa_worker import QAWorker, is_question
 
 
-class CodexQATests(unittest.TestCase):
+class QAWorkerTests(unittest.TestCase):
     def test_question_detection_and_debounce_with_context(self):
         now = [10.0]
         events = queue.Queue()
@@ -13,7 +13,7 @@ class CodexQATests(unittest.TestCase):
         def run(prompt, cancel):
             prompts.append(prompt)
             return "示例答案"
-        qa = CodexQA(events, run, lambda: now[0])
+        qa = QAWorker(events, run, lambda: now[0])
         qa.feed("关闭时不能发送什么？")
         self.assertFalse(qa.context)
         qa.set_enabled(True)
@@ -41,7 +41,7 @@ class CodexQATests(unittest.TestCase):
             started.set()
             release.wait(2)
             return "旧答案"
-        qa = CodexQA(events, run)
+        qa = QAWorker(events, run)
         qa.set_enabled(True)
         qa.feed("为什么？")
         qa.tick(force=True)
@@ -58,7 +58,7 @@ class CodexQATests(unittest.TestCase):
 
     def test_duplicate_question_and_bounded_context(self):
         events = queue.Queue()
-        qa = CodexQA(events, lambda p, c: "答案")
+        qa = QAWorker(events, lambda p, c: "答案")
         qa.set_enabled(True)
         qa.feed("为什么天空是蓝色？")
         qa.tick(force=True)
@@ -73,15 +73,6 @@ class CodexQATests(unittest.TestCase):
             qa.feed("背景。" * 1000)
         self.assertEqual(len(qa.context), 12)
         self.assertLessEqual(len(qa.context[-1]), 1200)
-
-    def test_cli_uses_isolated_working_directory_and_no_shell_tools(self):
-        args = command("codex.exe", "C:/temp/qa")
-        self.assertIn("--ignore-user-config", args)
-        self.assertIn("--ephemeral", args)
-        self.assertIn("read-only", args)
-        self.assertEqual(args[args.index("-C") + 1], "C:/temp/qa")
-        self.assertEqual(args[args.index("shell_tool") - 1], "--disable")
-        self.assertEqual(args[-1], "-")
 
 
 if __name__ == "__main__":

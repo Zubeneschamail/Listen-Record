@@ -7,6 +7,104 @@ from theme import color
 from scrollbars import SlimScrollbar
 
 
+class StatusIndicator(tk.Frame):
+    """A semantic status dot whose color survives theme changes."""
+    _custom_theme = True
+    COLORS = {'verified': '#15803d', 'success': '#15803d',
+              'checking': '#2563eb', 'progress': '#2563eb',
+              'unavailable': '#b91c1c', 'unauthenticated': '#b91c1c', 'error': '#b91c1c',
+              'cancelled': '#9299aa'}
+
+    def __init__(self, parent, textvariable, statevariable):
+        super().__init__(parent, bg='#f7f8fa', bd=0)
+        self.statevariable = statevariable
+        self.dark = False
+        self.dot = tk.Label(self, text='●', font=(typography.UI_FAMILY, 8), bd=0, padx=0)
+        self.dot.pack(side='left', padx=(0, 6))
+        self.label = tk.Label(self, textvariable=textvariable, font=(typography.UI_FAMILY, 9), bd=0, padx=0)
+        self.label.pack(side='left')
+        self.trace = statevariable.trace_add('write', self.refresh)
+        self.bind('<Destroy>', self.cleanup)
+        self.apply_theme(False)
+
+    def refresh(self, *_):
+        self.dot.configure(fg=color(self.COLORS.get(self.statevariable.get(), '#b45309'), self.dark))
+
+    def apply_theme(self, dark):
+        self.dark = dark
+        surface = color('#f7f8fa', dark)
+        self.configure(bg=surface)
+        self.dot.configure(bg=surface)
+        self.label.configure(bg=surface, fg=color('#4f586b', dark))
+        self.refresh()
+
+    def cleanup(self, event):
+        if event.widget is self:
+            self.statevariable.trace_remove('write', self.trace)
+
+
+class TitleStatus(tk.Label):
+    """Single-line status that fits the remaining title-bar space."""
+    def __init__(self, parent, variable):
+        super().__init__(parent, bg='#f7f8fa', fg='#858b98', anchor='w',
+                         font=(typography.UI_FAMILY, 8), bd=0, padx=4, width=1)
+        self.variable = variable
+        self.tooltip_timer = self.tooltip_window = None
+        self.trace = variable.trace_add('write', self.refresh)
+        self.bind('<Configure>', self.refresh)
+        self.bind('<Enter>', self.schedule_tooltip)
+        self.bind('<Leave>', self.hide_tooltip)
+        self.bind('<ButtonPress-1>', self.hide_tooltip)
+        self.bind('<Destroy>', self.cleanup)
+        self.refresh()
+
+    def refresh(self, *_):
+        from tkinter import font as tkfont
+        self.hide_tooltip()
+        text = ' '.join(self.variable.get().split())
+        font = tkfont.Font(font=self.cget('font'))
+        available = max(0, self.winfo_width() - 8)
+        if font.measure(text) > available:
+            while text and font.measure(text + '…') > available:
+                text = text[:-1]
+            text = text + '…' if text else ''
+        self.configure(text=text)
+
+    def schedule_tooltip(self, event=None):
+        self.hide_tooltip()
+        if self.variable.get():
+            self.tooltip_timer = self.after(500, self.show_tooltip)
+
+    def show_tooltip(self):
+        self.tooltip_timer = None
+        if not self.winfo_viewable():
+            return
+        tip = self.tooltip_window = tk.Toplevel(self)
+        tip.overrideredirect(True)
+        tip.attributes('-topmost', True)
+        tk.Label(tip, text=self.variable.get(), bg='#263e52', fg='white',
+                 font=(typography.UI_FAMILY, 9), wraplength=420,
+                 justify='left', padx=9, pady=5).pack()
+        tip.update_idletasks()
+        x = max(0, min(self.winfo_rootx(), tip.winfo_screenwidth() - tip.winfo_reqwidth()))
+        y = min(self.winfo_rooty() + self.winfo_height() + 6,
+                tip.winfo_screenheight() - tip.winfo_reqheight())
+        tip.geometry(f'+{x}+{max(0, y)}')
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip_timer:
+            self.after_cancel(self.tooltip_timer)
+            self.tooltip_timer = None
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+            self.tooltip_window = None
+
+    def cleanup(self, event):
+        if event.widget is self:
+            self.hide_tooltip()
+            self.variable.trace_remove('write', self.trace)
+
+
 class ToggleChip(tk.Canvas):
     """Compact rounded toggle shared by AI and Auto, including keyboard input."""
     _custom_theme = True
@@ -160,10 +258,14 @@ class SplitterHandle(tk.Canvas):
     _custom_theme = True
 
     def __init__(self, panes):
+        self.vertical = str(panes.cget('orient')) == 'vertical'
+        self.enabled = True
         super().__init__(panes, width=13, bd=0, highlightthickness=0,
-                         bg='white', cursor='sb_h_double_arrow')
+                         bg='white', cursor='sb_v_double_arrow' if self.vertical else 'sb_h_double_arrow')
         self.panes, self.drag = panes, None
-        self.line = self.create_line(6, 0, 6, 10000, fill='#E3E9F0')
+        self.line = self.create_line(*( (0, 6, 10000, 6) if self.vertical else (6, 0, 6, 10000)), fill='#E3E9F0')
+        self.junction_panes = None
+        self.junction = self.create_line(6, 0, 13, 0, fill='#E3E9F0', state='hidden')
         self.bind('<ButtonPress-1>', self.begin)
         self.bind('<B1-Motion>', self.move)
         self.bind('<ButtonRelease-1>', self.end)
@@ -173,12 +275,34 @@ class SplitterHandle(tk.Canvas):
     def apply_theme(self, dark):
         self.configure(bg=color('white', dark))
         self.itemconfigure(self.line, fill=color('#E3E9F0', dark))
+        self.itemconfigure(self.junction, fill=color('#E3E9F0', dark))
+
+    def join_right_split(self, panes):
+        """Continue a nested horizontal divider across this handle's hit area."""
+        self.junction_panes = panes
+        panes.bind('<Configure>', self.position_junction, add='+')
+        for panel in panes.panes():
+            panes.nametowidget(str(panel)).bind('<Configure>', self.position_junction, add='+')
+        self.position_junction()
+
+    def position_junction(self, event=None):
+        panes = self.junction_panes
+        if panes is None or len(panes.panes()) != 2:
+            self.itemconfigure(self.junction, state='hidden')
+            return
+        y = panes.winfo_rooty() - self.panes.winfo_rooty() + panes.sash_coord(0)[1]
+        self.coords(self.junction, 6, y, 13, y)
+        self.itemconfigure(self.junction, state='normal')
 
     def position(self, event=None):
-        if len(self.panes.panes()) != 2:
+        if not self.enabled or len(self.panes.panes()) != 2:
             self.place_forget()
             return
-        self.place(x=self.panes.sash_coord(0)[0]-6, y=0, width=13, relheight=1, bordermode='ignore')
+        if self.vertical:
+            self.place(x=0, y=self.panes.sash_coord(0)[1]-6, height=13, relwidth=1, bordermode='ignore')
+        else:
+            self.place(x=self.panes.sash_coord(0)[0]-6, y=0, width=13, relheight=1, bordermode='ignore')
+        self.position_junction()
         tk.Misc.lift(self)
         # Scrollbars share this parent so their entire hit area can stay above
         # the wider sash overlay, including after a resize or pane movement.
@@ -187,7 +311,7 @@ class SplitterHandle(tk.Canvas):
                 tk.Misc.lift(widget)
 
     def begin(self, event):
-        self.drag = (self.panes.sash_coord(0)[0], event.x_root)
+        self.drag = (self.panes.sash_coord(0)[int(self.vertical)], event.y_root if self.vertical else event.x_root)
         self.target = self.drag[0]
         self.focus_set()
         self.grab_set()
@@ -197,15 +321,17 @@ class SplitterHandle(tk.Canvas):
         if self.drag:
             panes = self.panes.panes()
             minimum = int(self.panes.panecget(panes[0], 'minsize'))
-            maximum = self.panes.winfo_width() - int(self.panes.panecget(panes[1], 'minsize')) - 1
-            self.target = max(minimum, min(maximum, self.drag[0] + event.x_root - self.drag[1]))
-            self.panes.proxy_place(self.target, 0)
+            extent = self.panes.winfo_height() if self.vertical else self.panes.winfo_width()
+            pointer = event.y_root if self.vertical else event.x_root
+            maximum = extent - int(self.panes.panecget(panes[1], 'minsize')) - 1
+            self.target = max(minimum, min(maximum, self.drag[0] + pointer - self.drag[1]))
+            self.panes.proxy_place(0, self.target) if self.vertical else self.panes.proxy_place(self.target, 0)
         return 'break'
 
     def end(self, event):
         if self.drag:
             self.move(event)
-            self.panes.sash_place(0, self.target, 0)
+            self.panes.sash_place(0, 0, self.target) if self.vertical else self.panes.sash_place(0, self.target, 0)
             self.cancel()
             self.position()
         return 'break'
@@ -280,6 +406,19 @@ class SettingsTabs(ttk.Frame):
             tab.configure(bg=color(bg, dark), fg=color(fg, dark))
 
 
+def guard_combo_wheel(widget):
+    """Scroll the surrounding page without changing the selected setting."""
+    def wheel(event):
+        parent = widget.master
+        while parent is not None:
+            if isinstance(parent, ScrollPage):
+                return parent.wheel(event)
+            parent = parent.master
+        return 'break'
+    widget.bind('<MouseWheel>', wheel)
+    return widget
+
+
 class UIControls:
     def __init__(self, app):
         self.app = app
@@ -294,8 +433,14 @@ class UIControls:
 
     def combo(self, parent, **options):
         options.setdefault('width', 24)
-        return ttk.Combobox(parent, state='readonly', style='Settings.TCombobox',
-                            font=(typography.UI_FAMILY, 9), **options)
+        return guard_combo_wheel(ttk.Combobox(parent, state='readonly', style='Settings.TCombobox',
+                            font=(typography.UI_FAMILY, 9), **options))
+
+    def section(self, parent, title):
+        heading = ttk.Frame(parent)
+        heading.pack(fill='x', pady=(12, 8))
+        ttk.Label(heading, text=title, foreground='#4f586b',
+                  font=(typography.UI_FAMILY, 9, 'bold')).pack(side='left')
 
     def note(self, parent, text=None, variable=None):
         return ttk.Label(parent, text=text, textvariable=variable, wraplength=400,
@@ -307,13 +452,14 @@ class UIControls:
         button = self.button(row, caption, command)
         button.pack(side='right', padx=(12, 0))
         ttk.Label(row, text=title, foreground='#4f586b').pack(anchor='w')
-        self.note(row, description).pack(anchor='w', pady=(3, 0))
+        if description:
+            self.note(row, description).pack(anchor='w', pady=(3, 0))
         return button
 
     def button(self, parent, text, command, primary=False, width=None):
         surface = parent.cget("bg") if isinstance(parent, tk.Frame) else "#f7f8fa"
         icons = {"设置": "settings", "复制全文": "copy", "复制": "copy", "···": "more",
-                 "刷新": "refresh", "×": "close", "—": "minimize", "发送所选": "send",
+                 "刷新": "refresh", "×": "close", "—": "minimize", "发送": "send",
                  "开始转写": "waveform", "停止转写": "waveform", "添加资料": "add"}
         factory = IconButton if text in icons else tk.Button
         widget = factory(parent, **({"icon": icons[text]} if text in icons else {}),

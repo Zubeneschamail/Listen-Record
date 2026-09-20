@@ -57,7 +57,8 @@ class ReferencePathItem(tk.Label):
     def position_close(self):
         font = tkfont.Font(font=self.cget('font'))
         x = min(font.measure(self.cget('text')) + 4, max(0, self.winfo_width() - 20))
-        self.close_button.place(x=x, rely=.5, y=-2, anchor='w', width=18, height=18)
+        self.close_button.place(x=x, rely=.5, y=-2, anchor='w', width=18, height=18,
+                                bordermode='outside')
 
     def schedule_tip(self, event=None):
         self.hide_tip()
@@ -98,23 +99,21 @@ class ReferencePathItem(tk.Label):
             self.after_cancel(self.timer)
             self.timer = None
         if self.tip:
-            self.tip.destroy()
-            self.tip = None
+            tip, self.tip = self.tip, None
+            if tip.winfo_exists():
+                tip.destroy()
 
 
 class ReferencePathLabel(tk.Frame):
     """Each source has its own hover target and removal action."""
     _custom_theme = True
 
-    def __init__(self, parent, status, remove):
+    def __init__(self, parent, remove):
         super().__init__(parent, bg='white', height=22, width=1)
         self.pack_propagate(False)
-        self.status, self.remove = status, remove
+        self.remove = remove
         self.paths, self.items = [], []
         self.dark = False
-        self.status_label = tk.Label(self, anchor='w', bg='white', fg='#9297a4',
-                                     font=(typography.UI_FAMILY, 8))
-        self.status.trace_add('write', self.refresh)
         self.bind('<Configure>', self.refresh)
 
     def set_paths(self, paths):
@@ -129,28 +128,22 @@ class ReferencePathLabel(tk.Frame):
         self.refresh()
 
     def refresh(self, *_):
-        self.status_label.pack_forget()
         for item in self.items:
             item.place_forget()
-        if self.status.get():
-            self.status_label.configure(text=self.status.get())
-            self.status_label.pack(fill='both', expand=True)
-        else:
-            available = max(1, self.winfo_width())
-            share = max(1, available // max(1, len(self.items)) - 4)
-            x = 0
-            for item in self.items:
-                font = tkfont.Font(font=item.cget('font'))
-                width = min(224, font.measure(item.paths[0]) + 24, share)
-                item.place(x=x, y=0, width=width, relheight=1)
-                x += width + 4
+        available = max(1, self.winfo_width())
+        share = max(1, available // max(1, len(self.items)) - 4)
+        x = 0
+        for item in self.items:
+            font = tkfont.Font(font=item.cget('font'))
+            width = min(224, font.measure(item.paths[0]) + 24, share)
+            item.place(x=x, y=0, width=width, relheight=1)
+            x += width + 4
 
     def apply_theme(self, dark):
         from theme import color
         self.dark = dark
         surface = color('white', dark)
         self.configure(bg=surface)
-        self.status_label.configure(bg=surface, fg=color('#9297a4', dark))
         for item in self.items:
             item.configure(bg=surface, fg=color('#9297a4', dark))
             item.close_button.configure(bg=surface, fg=color('#737b8c', dark),
@@ -199,21 +192,31 @@ def build(app, parent):
     def provider_changed(*_):
         notice.set('DeepSeek 会按需搜索和读取，并在回答中标注文件来源。'
                    if app.qa_settings['provider'] == 'deepseek' else
-                   '当前仅 DeepSeek 支持查阅资料，请在「AI 与外观」切换模型服务。')
+                   '仅 DeepSeek 支持查阅资料，请在「答疑」中配置模型服务。')
 
     def commit(paths):
         updated = {'enabled': enabled.get(), 'paths': paths}
         try:
-            save_settings(updated)
+            if not app.settings_visible:
+                save_settings(updated)
         except OSError:
             enabled.set(settings['enabled'])
             messagebox.showerror('保存失败', '无法保存参考资料设置，请检查磁盘权限或空间。', parent=dialog_parent())
             return
         settings.update(updated)
-        app.qa.reset()
-        app.qa_cache.clear()
-        app.qa_selection = None
-        app.qa_status.set('')
+        if not app.settings_visible:
+            app.qa.reset()
+            app.qa_selection = None
+            app.qa_status.set('')
+        refresh()
+
+    def snapshot():
+        return {'enabled': enabled.get(), 'paths': list(settings['paths'])}
+
+    def restore(values):
+        settings.update(enabled=values['enabled'], paths=list(values['paths']))
+        enabled.set(values['enabled'])
+        selected_path.set('选择资料可查看完整路径。')
         refresh()
 
     def add(values):
@@ -266,14 +269,14 @@ def build(app, parent):
     ui.button(actions, '移除', remove).pack(side='right')
     listing.bind('<<ListboxSelect>>', selection)
     ui.note(parent, variable=notice).pack(fill='x', pady=(16, 6))
-    ui.note(parent, '支持文本、代码、PDF、DOCX。只读访问；相关片段会发送给 DeepSeek。\n'
-            '自动跳过依赖、构建目录和常见密钥文件。扫描版 PDF 请先做 OCR；\n'
-            'PDF / DOCX 最大 20 MB，PDF 最多 100 页，文本最大 2 MB。').pack(fill='x')
+    ui.note(parent, '支持文本、代码、PDF、DOCX；相关片段会发送给模型。\n'
+            '扫描版 PDF 需先识别为文字。').pack(fill='x')
     app.qa_provider_name.trace_add('write', provider_changed)
     # Named controls support UI verification without touching personal files.
     app.reference_controls = dict(listing=listing, enabled=enabled, add=add, remove=remove,
                                   add_files=add_files, add_folder=add_folder,
-                                  paths=lambda: list(settings['paths']), remove_path=remove_path)
+                                  paths=lambda: list(settings['paths']), remove_path=remove_path,
+                                  snapshot=snapshot, restore=restore, persist=lambda: save_settings(snapshot()))
     refresh()
 
 

@@ -8,7 +8,7 @@ from app import App
 class FontSizeTests(unittest.TestCase):
     def test_size_updates_existing_and_future_bubbles_and_is_saved(self):
         with patch('app.GlobalHotkey'), patch('app.App.start_tray'), \
-                patch('codex_connection.CodexConnection.check'), \
+                patch('qa_connection.QAConnection.check'), \
                 patch('app.preferences', return_value={}), \
                 patch('app.save_preferences'), patch('app.save_desktop') as save:
             root = tk.Tk()
@@ -34,7 +34,7 @@ class FontSizeTests(unittest.TestCase):
                 self.assertEqual(bubble.winfo_height(), old_height)
             finally:
                 app.qa.set_enabled(False)
-                app.codex_connection.close()
+                app.qa_connection.close()
                 app.hotkey.close()
                 for timer in root.tk.call('after', 'info'):
                     root.after_cancel(timer)

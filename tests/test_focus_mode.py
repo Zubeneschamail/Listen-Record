@@ -7,7 +7,7 @@ from app import App
 class FocusModeTests(unittest.TestCase):
     def test_focus_mode_fills_existing_window_and_restores_chrome(self):
         with patch('app.GlobalHotkey'), patch('app.App.start_tray'), \
-             patch('codex_connection.CodexConnection.check'):
+             patch('qa_connection.QAConnection.check'):
             root = tk.Tk()
             app = App(root)
             try:
@@ -18,11 +18,11 @@ class FocusModeTests(unittest.TestCase):
                     app.toggle_qa()
                     root.update()
                     original = root.geometry()
-                    self.assertEqual(app.qa_header.cget('cursor'), '')
+                    self.assertEqual(app.qa_panel.cget('cursor'), '')
                     # Content surfaces must not move the normal window, even
                     # when a previous title-bar drag left an origin behind.
                     app._drag_origin = (0, 0)
-                    for surface in (app.qa_header, app.chat.canvas, app.chat.inner):
+                    for surface in (app.qa_panel, app.chat.canvas, app.chat.inner):
                         surface.event_generate('<ButtonPress-1>', x=5, y=5, rootx=100, rooty=100)
                         surface.event_generate('<B1-Motion>', x=35, y=25, rootx=130, rooty=120)
                         root.update()
@@ -50,8 +50,8 @@ class FocusModeTests(unittest.TestCase):
                 app.toggle_focus_mode()
                 root.update()
                 x, y = root.winfo_rootx(), root.winfo_rooty()
-                app.qa_header.event_generate('<ButtonPress-1>', x=5, y=5, rootx=x+5, rooty=y+5)
-                app.qa_header.event_generate('<B1-Motion>', x=35, y=25, rootx=x+35, rooty=y+25)
+                app.qa_panel.event_generate('<ButtonPress-1>', x=5, y=5, rootx=x+5, rooty=y+5)
+                app.qa_panel.event_generate('<B1-Motion>', x=35, y=25, rootx=x+35, rooty=y+25)
                 root.update()
                 self.assertEqual((root.winfo_rootx(), root.winfo_rooty()), (x+30, y+20))
                 grip = app.resize_handles['se']
@@ -68,7 +68,7 @@ class FocusModeTests(unittest.TestCase):
                 self.assertEqual(root.geometry(), changed)
             finally:
                 app.qa.set_enabled(False)
-                app.codex_connection.close()
+                app.qa_connection.close()
                 app.hotkey.close()
                 for timer in root.tk.call('after', 'info'):
                     root.after_cancel(timer)

@@ -8,6 +8,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -19,16 +20,20 @@ import pyaudiowpatch as pa
 from scipy.signal import resample_poly
 from opencc import OpenCC
 from hotkey import GlobalHotkey
-from codex_qa import CodexQA
-from codex_connection import CodexConnection
-from qa_provider import APIProvider, PROVIDERS, DEFAULTS, load_settings
+from qa_worker import QAWorker
+from qa_connection import QAConnection
+from clipboard_watch import ClipboardWatcher
+from qa_images import ConversationImage
+from qa_composer import QuestionComposer
+from qa_provider import APIProvider, PROVIDERS, DEFAULTS, load_settings, image_input_error
 import theme
 from segmentation import PauseSegmenter, WordAssembler, decode_chunk, DraftPreview
 from paragraphs import ParagraphAssembler
-from recognition import RecognitionContext, read_preferences, save_preferences
+from recognition import RecognitionContext, save_preferences
 from scrollbars import SlimScrollbar
 from chat_view import ChatView
-from ui_components import UIControls, ToggleChip, SplitterHandle
+from ui_components import UIControls, SplitterHandle, TitleStatus
+from icon_button import IconToggle
 from settings_view import build_settings
 from audio_levels import AudioLevelNormalizer
 from model_runtime import load_model
@@ -126,6 +131,8 @@ class Transcriber:
             if self.stop_event.is_set():
                 return
             self.emit('status', '正在连接音频设备…')
+            backend = getattr(getattr(self.model, 'model', None), 'device', 'cpu')
+            self.emit('recognition_backend', (model_name, backend))
             audio_api = pa.PyAudio()
             devices = device if isinstance(device, list) else [{"index": device}]
             if not devices:
@@ -263,14 +270,28 @@ class App:
         typography.setup(root)
         self.events = queue.Queue()
         self.engine = Transcriber(self.events)
-        self.qa = CodexQA(self.events)
+        from gpu_diagnostics import GPUCheck
+        self.gpu_check = GPUCheck(self.events)
+        self.gpu_check_status = tk.StringVar(value='尚未检测')
+        self.gpu_detection_state = tk.StringVar(value='unknown')
+        self.gpu_check_detail = tk.StringVar(value='检测显卡、运行库和当前所选模型的实际 GPU 推理。无需联网。')
+        self.gpu_runtime_status = tk.StringVar(value='当前转写：尚未加载模型')
+        self.startup_checks = self.startup_overlay = None
+        self.startup_results = {}
+        self.startup_pending_issues = []
+        self.startup_advance_on_hide = False
+        self.qa = QAWorker(self.events)
         self.qa.context_provider = self.session_context_snapshot
-        self.codex_connection = CodexConnection(self.events)
+        self.qa_connection = QAConnection(self.events)
         self.qa_settings = load_settings()
         self.qa_provider_name = tk.StringVar(value=PROVIDERS[self.qa_settings['provider']])
-        self.codex_status = tk.StringVar(value="尚未检测")
-        self.codex_detail = tk.StringVar(value="点击检测会发送测试请求，消耗少量 Codex 额度。")
+        self.connection_status = tk.StringVar(value="尚未检测")
+        self.qa_detection_state = tk.StringVar(value='unknown')
+        self.connection_detail = tk.StringVar(value="点击检测会发送测试请求，消耗少量 API 额度。")
         self.dark_mode = tk.BooleanVar(value=preferences().get('dark_mode', False))
+        self.capture_hidden = tk.BooleanVar(value=preferences().get('capture_hidden', False))
+        from capture_privacy import CapturePrivacy
+        self.capture_privacy = CapturePrivacy(root, self.capture_hidden.get())
         try:
             size = max(8, min(16, int(preferences().get('font_size', 9))))
         except (ValueError, TypeError):
@@ -279,10 +300,16 @@ class App:
         root._body_font_size = size
         self.qa_enabled = tk.BooleanVar(value=False)
         self.auto_qa = tk.BooleanVar(value=False)
+        self.clipboard_status = tk.StringVar(value='已关闭；开启后将新复制的文字或图片发送给当前 AI 服务。')
+        self.clipboard_watcher = ClipboardWatcher(self.events)
+        self.clipboard_pending = deque()
+        self.clipboard_request_generation = None
         self.qa_history = []
+        self.qa_image_contexts = {}
+        self.qa_pending_image_context = None
         self.qa_display_history = []
+        self.qa_display_images = {}
         self.question_drafts = {}
-        self.qa_cache = {}
         self.qa_selection = None
         self.multi_rows = set()
         self.qa_question = ""
@@ -352,18 +379,24 @@ class App:
         hint = ttk.Label(header, text="", foreground="#bd544f")
         self.hotkey_hint = hint
         drag_space = ttk.Frame(header)
-        drag_space.pack(side="left", fill="x", expand=True)
+        drag_space.pack(side="left", fill="both", expand=True)
+        self.qa_status_label = TitleStatus(drag_space, self.qa_status)
+        self.qa_status_label.place(x=0, y=0, relwidth=1, relheight=1)
         for widget in (header, brand, hint, drag_space):
             widget.bind("<ButtonPress-1>", self.drag_begin)
             widget.bind("<B1-Motion>", self.drag_move)
+        self.qa_status_label.bind('<ButtonPress-1>', self.drag_begin, add='+')
+        self.qa_status_label.bind('<B1-Motion>', self.drag_move, add='+')
         button(header, "×", self.close).pack(side="right")
         button(header, "—", self.minimize).pack(side="right")
         self.settings_button = button(header, "设置", self.toggle_settings)
         self.settings_button.pack(side="right", padx=(4, 0))
         self.settings_button.bind("<Leave>", lambda e: self.settings_button.configure(
             bg=self.theme_color("#E6F2FB" if self.settings_visible else "#f7f8fa")), add="+")
-        self.ai_button = ToggleChip(header, 'AI', self.qa_enabled, self.toggle_qa, surface='#f7f8fa')
-        self.ai_button.pack(side='right', padx=(4, 0))
+        self.auto_button = IconToggle(header, 'auto',
+            '自动读取转录问题与剪贴板内容进行答疑', self.auto_qa, self.toggle_auto_qa,
+            surface='#f7f8fa')
+        self.auto_button.pack(side='right', padx=(4, 0))
 
         build_settings(self, button)
 
@@ -429,40 +462,48 @@ class App:
         self.splitter_handle = SplitterHandle(self.columns)
         for panel in (self.left_panel, self.qa_panel):
             panel.bind('<Configure>', self.splitter_handle.position, add='+')
-        qa_header = self.qa_header = tk.Frame(self.qa_panel, bg="white", padx=12, pady=5)
-        qa_header.pack(fill="x")
-        tk.Label(qa_header, textvariable=self.qa_provider_name, bg="white", fg="#737b8c", font=(typography.UI_FAMILY, 9, "bold")).pack(side="left")
-        self.answer_copy_button = button(qa_header, "复制", self.copy_answer)
+        self.answer_copy_button = button(self.qa_panel, "复制", self.copy_answer)
         self.answer_copy_button.configure(bg="white", font=(typography.UI_FAMILY, 8))
-        self.answer_copy_button.pack(side="right")
-        self.codex_status_label = tk.Label(qa_header, textvariable=self.codex_status,
-                                          bg="white", fg="#9297a4", font=(typography.UI_FAMILY, 8))
-        self.codex_status_label.pack(side="left", padx=(8, 0))
-        self.auto_button = ToggleChip(qa_header, 'Auto', self.auto_qa, self.toggle_auto_qa)
-        self.auto_button.pack(side="right", padx=(4, 0), before=self.codex_status_label)
         # Keep a drag surface when the normal title bar is hidden. Text widgets
         # retain their selection behavior; copy/send buttons remain clickable.
-        for widget in (qa_header, self.chat.canvas, self.chat.inner,
-                       *(child for child in qa_header.winfo_children() if isinstance(child, tk.Label))):
+        for widget in (self.qa_panel, self.chat.canvas, self.chat.inner):
             widget.bind('<ButtonPress-1>', self.focus_drag_begin, add='+')
             widget.bind('<B1-Motion>', self.focus_drag_move, add='+')
-        qa_footer = tk.Frame(self.qa_panel, bg="white")
-        qa_footer.pack(side="bottom", fill="x", padx=10, pady=(2, 3))
-        self.ask_selected_button = button(qa_footer, "发送所选", self.ask_selected)
+        self.qa_rows = tk.PanedWindow(self.qa_panel, orient="vertical", bg="#E3E9F0",
+                                     bd=0, sashwidth=1, sashrelief="flat", showhandle=False,
+                                     opaqueresize=False, proxybackground="#007ACC",
+                                     proxyborderwidth=0, proxyrelief="flat")
+        self.qa_rows.pack(fill="both", expand=True)
+        self.composer = QuestionComposer(self.qa_rows, self.send_question, self.font_size.get())
+        qa_footer = self.composer.actions
+        self.ask_selected_button = button(qa_footer, "发送", self.send_question)
         self.ask_selected_button.pack(side="right")
         from reference_settings import build_add_button
         build_add_button(self, qa_footer)
         from reference_settings import ReferencePathLabel
-        self.qa_status_label = self.reference_path_label = ReferencePathLabel(
-            qa_footer, self.qa_status, self.reference_controls['remove_path'])
+        self.reference_path_label = ReferencePathLabel(
+            self.composer.middle, self.reference_controls['remove_path'])
         self.reference_path_label.set_paths(self.reference_controls['paths']())
-        self.qa_status_label.pack(side="left", fill="x", expand=True)
-        self.qa_text = tk.Text(self.qa_panel, wrap="word", bg="white", fg="#263044", relief="flat",
+        self.composer.middle.pack(side='left', fill='both', expand=True)
+        self.composer.set_reference_label(self.reference_path_label)
+        self.qa_text = tk.Text(self.qa_rows, wrap="word", bg="white", fg="#263044", relief="flat",
+                              bd=0, highlightthickness=0,
                               font=(typography.UI_FAMILY, self.font_size.get()), padx=16, pady=10, spacing1=2, spacing2=5, spacing3=12,
-                              state="disabled", width=1, height=1)
-        self.qa_text.tag_configure("question", foreground="#007ACC", spacing1=8, spacing3=10)
+                              state="disabled", width=1, height=1, selectborderwidth=0,
+                              selectbackground='#E6F2FB', selectforeground='#263044')
+        self.qa_text.tag_configure("question", foreground="#007ACC", spacing1=8, spacing3=10, rmargin=36)
         self.qa_text.tag_bind("question", "<Button-1>", self.edit_question)
-        self.qa_text.pack(fill="both", expand=True)
+        self.qa_rows.add(self.qa_text, minsize=60, stretch="always")
+        self.qa_rows.add(self.composer, minsize=80, height=126, stretch="never")
+        self.composer_splitter = SplitterHandle(self.qa_rows)
+        self.splitter_handle.join_right_split(self.qa_rows)
+        for panel in (self.qa_text, self.composer):
+            panel.bind('<Configure>', self.composer_splitter.position, add='+')
+        self.composer.on_toggle = self.resize_composer
+        self.qa_rows.bind('<ButtonPress-1>', lambda event: None if self.composer.expanded else 'break')
+        self.qa_text.bind('<Configure>', self.resize_qa_images, add='+')
+        self.qa_text.bind('<<SelectAll>>', self.select_all_qa)
+        self.qa_text.bind('<<Selection>>', self.trim_qa_selection)
         self.answer_scrollbar = SlimScrollbar(self.qa_text, overlay_parent=self.columns)
         self.qa_placeholder = tk.Label(self.qa_text, text="选择文字，开始提问", bg="white", fg="#a0a5b1",
                                        font=(typography.UI_FAMILY, 9), justify="center")
@@ -476,6 +517,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Configure>", self.on_resize)
         self.focus_mode = False
+        self.open_qa()
         root.bind('<F11>', self.toggle_focus_mode)
         root.bind('<F12>', self.toggle_auto_shortcut)
         root.bind('<Escape>', self.exit_focus_mode)
@@ -483,12 +525,78 @@ class App:
             widget.bind("<Control-BackSpace>", self.clear_conversation)
         root.after(100, self.enable_taskbar)
         root.bind("<Map>", self.on_main_window_mapped, add="+")
+        root.bind('<FocusIn>', self.raise_settings, add='+')
         root.after(200, self.start_tray)
         root.after(100, self.poll)
         self.hotkey.start()
 
+    def resize_composer(self, expanded):
+        height = self.composer.expanded_height if expanded else 40
+        self.composer_splitter.cancel()
+        self.composer_splitter.enabled = expanded
+        self.qa_rows.paneconfigure(self.composer, minsize=80 if expanded else 40, height=height)
+        self.composer_splitter.position()
+
     def theme_color(self, value):
         return theme.color(value, self.dark_mode.get())
+
+    def begin_startup_checks(self):
+        if self.closing or self.startup_overlay is not None or self.busy:
+            return
+        from startup_checks import StartupChecks
+        from startup_view import StartupOverlay
+        self.startup_pending_issues.clear()
+        self.startup_advance_on_hide = False
+        if self.settings_visible:
+            self.hide_settings()
+        self.gpu_check.close()
+        self.gpu_check_button.configure(state='disabled')
+        self.startup_checks = StartupChecks()
+        self.startup_overlay = StartupOverlay(self)
+        profile = dict(DEFAULTS['deepseek'], **self.qa_settings['profiles'].get('deepseek', {}))
+        profile['base_url'] = DEFAULTS['deepseek']['base_url']
+        self.startup_checks.start(self.model.get().split()[0], profile)
+
+    def finish_startup_checks(self):
+        self.startup_results = dict(self.startup_checks.results)
+        self.startup_checks.close()
+        self.startup_checks = None
+        self.startup_overlay.destroy()
+        self.startup_overlay = None
+        self.gpu_check_button.configure(state='normal')
+        state, detail = self.startup_results['gpu']
+        self.gpu_check_status.set('GPU 检测通过' if state == 'success' else 'GPU 未通过')
+        self.gpu_detection_state.set(state)
+        self.gpu_check_detail.set(detail)
+        if self.qa_settings['provider'] == 'deepseek':
+            state, detail = self.startup_results['deepseek']
+            self.qa_connection.record(None if state == 'success' else detail)
+        issues = [key for key, (state, _) in self.startup_results.items() if state == 'error']
+        self.startup_pending_issues = issues
+        if issues:
+            self.advance_startup_issue()
+
+    def advance_startup_issue(self):
+        if self.closing or self.startup_overlay is not None or not self.startup_pending_issues:
+            return
+        self.open_startup_issue(self.startup_pending_issues.pop(0), advance=True)
+
+    def open_startup_issue(self, key, advance=False):
+        self.toggle_settings()
+        page = self.settings_pages['ai' if key == 'deepseek' else 'audio']
+        self.settings_tabs.select(page)
+        page.canvas.yview_moveto(0)
+        if key == 'model':
+            from desktop_dialogs import model_manager
+            model_manager(self, on_close=self.advance_startup_issue if advance else None)
+        elif key == 'deepseek':
+            from qa_settings_dialog import show
+            show(self, initial_provider='deepseek', on_close=self.advance_startup_issue if advance else None,
+                 initial_error=self.startup_results[key][1])
+        else:
+            self.startup_advance_on_hide = advance
+            self.root.update_idletasks()
+            page.canvas.yview_moveto(max(0, self.gpu_settings_row.winfo_y()-8) / max(1, page.content.winfo_height()))
 
     def toggle_focus_mode(self, event=None):
         if self.root.grab_current() is not None:
@@ -541,6 +649,7 @@ class App:
         size = self.font_size.get()
         self.root._body_font_size = size
         self.qa_text.configure(font=(typography.UI_FAMILY, size))
+        self.composer.set_font_size(size)
         self.text.configure(font=(typography.UI_FAMILY, size))
         for bubble in self.chat.bubbles.values():
             bubble.font.configure(size=size)
@@ -557,14 +666,18 @@ class App:
             if values.get(key) in widget['values']:
                 widget.set(values[key])
 
-    def save_desktop_settings(self):
+    def save_desktop_settings(self, force=False, raise_errors=False):
+        if self.settings_visible and not force:
+            return
         try:
             save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
             save_desktop(dict(model=self.model.get(), language=self.language.get(), mode=self.mode.get(),
                               output=self.device.get(), input=self.microphone.get(), dark_mode=self.dark_mode.get(),
-                              font_size=self.font_size.get()))
+                              font_size=self.font_size.get(), capture_hidden=self.capture_privacy.enabled))
         except OSError:
             logging.exception('Saving desktop settings')
+            if raise_errors:
+                raise
 
     def open_folder(self, path):
         import os
@@ -590,20 +703,6 @@ class App:
             self.root.withdraw()
         else:
             messagebox.showerror('托盘不可用', '无法创建托盘图标，请重试。', parent=self.root)
-
-    def import_legacy_data(self):
-        if self.busy:
-            messagebox.showinfo('迁移数据', '请先停止转写。', parent=self.root)
-            return
-        folder = filedialog.askdirectory(title='选择旧版闻录文件夹', parent=self.root)
-        if folder:
-            try:
-                from app_paths import migrate_legacy
-                migrate_legacy(folder)
-                self.hotwords.set(read_preferences(DATA / 'recognition-settings.json'))
-                messagebox.showinfo('迁移完成', '缺少的记录已复制，已有记录和原文件均保留。', parent=self.root)
-            except OSError as exc:
-                messagebox.showerror('迁移失败', str(exc), parent=self.root)
 
     def open_model_manager(self):
         from desktop_dialogs import model_manager
@@ -724,10 +823,32 @@ class App:
     def minimize(self):
         self.hide_to_tray()
 
+    def raise_settings(self, event=None):
+        """Keep the active settings dialog above its owner without stealing input."""
+        if not self.settings_visible or self.settings_window.state() == 'withdrawn':
+            return
+        try:
+            grabbed = self.root.grab_current()
+        except (tk.TclError, KeyError):
+            # A combobox popup may own a Tcl-only grab. Leave that popup in front.
+            return
+        window = self.settings_window
+        pinned = bool(self.root.attributes('-topmost'))
+        if bool(window.attributes('-topmost')) != pinned:
+            window.attributes('-topmost', pinned)
+        if grabbed is not None and grabbed.winfo_toplevel() is not window:
+            modal = grabbed.winfo_toplevel()
+            if str(modal.transient()) == str(window):
+                modal.lift()
+            return
+        window.lift()
+
     def toggle_settings(self):
         if self.settings_visible:
-            self.settings_window.lift()
+            self.raise_settings()
             return
+        from settings_session import SettingsSession
+        self.settings_session = SettingsSession(self)
         self.settings_visible = True
         self.settings_button.configure(bg=self.theme_color("#E6F2FB"), fg=self.theme_color("#737b8c"))
         window = self.settings_window
@@ -742,14 +863,35 @@ class App:
         from window_effects import apply_shadow
         self.root.after_idle(lambda: apply_shadow(window))
         self.root.after_idle(self.apply_theme)
-        window.lift()
         window.grab_set()
+        self.raise_settings()
         self.settings_tabs.focus_set()
 
-    def hide_settings(self, event=None):
-        self.save_desktop_settings()
+    def save_settings_dialog(self):
+        if not self.settings_visible:
+            return
+        from capture_privacy import CapturePrivacyError
+        try:
+            self.settings_session.save()
+        except CapturePrivacyError as exc:
+            messagebox.showerror('共享隐藏未生效', str(exc), parent=self.settings_window)
+            return
+        except OSError:
+            messagebox.showerror('保存失败', '设置未保存，请检查磁盘空间或写入权限后重试。', parent=self.settings_window)
+            return
+        self.hide_settings(discard=False)
+
+    def hide_settings(self, event=None, discard=True, restore_preview=True):
+        if not self.settings_visible:
+            return 'break'
+        if discard:
+            self.settings_session.restore(preview=restore_preview)
+        self.settings_session = None
         self.settings_window.grab_release()
         self.settings_window.withdraw()
+        if self.startup_advance_on_hide:
+            self.startup_advance_on_hide = False
+            self.root.after_idle(self.advance_startup_issue)
         self.settings_visible = False
         self.settings_button.configure(bg=self.theme_color("#f7f8fa"), fg=self.theme_color("#737b8c"))
         self.root.focus_set()
@@ -758,6 +900,7 @@ class App:
     def toggle_pin(self):
         self.pinned = not self.pinned
         self.root.attributes("-topmost", self.pinned)
+        self.raise_settings()
         self.root.after_idle(self.enable_taskbar)
         self.pin_button.configure(text="取消置顶" if self.pinned else "置顶窗口")
 
@@ -807,7 +950,22 @@ class App:
             widget.configure(state="disabled" if busy else "readonly")
         self.start_button.configure(text="停止转写" if busy else "开始转写", state="normal")
 
+    def check_gpu_acceleration(self):
+        if self.closing or self.gpu_check.active:
+            return
+        if self.busy:
+            self.gpu_check_detail.set('请先停止转写再检测，避免测试推理影响正在进行的识别。')
+            return
+        self.gpu_check_button.configure(state='disabled')
+        self.gpu_check_status.set('检测中…')
+        self.gpu_detection_state.set('checking')
+        self.gpu_check.start(self.model.get().split()[0])
+
     def start(self):
+        if self.startup_overlay is not None:
+            return
+        if self.settings_visible:
+            self.hide_settings()
         selected = []
         for source, widget, devices, enabled in (
                 ("system", self.device, self.devices, self.capture_mode.get() != "仅麦克风"),
@@ -835,6 +993,13 @@ class App:
             return
         self.session_rows = []
         self.failed = False
+        if self.gpu_check.active:
+            self.gpu_check.close()
+            self.gpu_check_status.set('已取消')
+            self.gpu_detection_state.set('cancelled')
+            self.gpu_check_detail.set('已开始转写，GPU 检测已取消。')
+            self.gpu_check_button.configure(state='normal')
+        self.gpu_runtime_status.set('当前转写：正在加载模型…')
         self.set_busy(True)
         self.engine.start(selected,
                           self.model.get().split()[0],
@@ -848,14 +1013,21 @@ class App:
 
     def clear(self, preserve_recording=False):
         self.cancel_question_edit()
+        self.composer.clear()
+        self.clipboard_pending.clear()
+        self.clipboard_request_generation = None
+        if self.auto_qa.get():
+            self.clipboard_watcher.start()
         self.qa.reset()
         self.qa_history.clear()
+        self.qa_image_contexts.clear()
+        self.qa_pending_image_context = None
         self.qa_display_history.clear()
+        self.qa_display_images.clear()
         self.question_drafts.clear()
-        self.qa_cache.clear()
         self.qa_selection = None
         self.multi_rows.clear()
-        self.ask_selected_button.configure(text="发送所选")
+        self.ask_selected_button.configure(text="发送")
         self.qa_question = self.qa_answer = ""
         self.qa_status.set("")
         self.render_qa()
@@ -871,6 +1043,8 @@ class App:
         self.text.configure(state="disabled")
 
     def clear_conversation(self, event=None):
+        if event is not None and event.widget is self.composer.input:
+            return  # Let the editor's native Ctrl+Backspace delete a word.
         if self.closing or self.root.grab_current():
             return "break"
         self.clear(preserve_recording=True)
@@ -916,23 +1090,23 @@ class App:
             self.text.see("end")
 
     def toggle_qa(self):
-        if not self.qa_enabled.get():
-            self.auto_qa.set(False)
-        self.qa.set_enabled(self.qa_enabled.get())
+        enabled = self.qa_enabled.get() or self.auto_qa.get()
+        if self.qa.enabled != enabled:
+            self.qa.set_enabled(enabled)
         self.text.tag_remove("qa_selected", "1.0", "end")
         self.chat.highlight(set())
         self.qa_selection = None
         self.multi_rows.clear()
-        self.ask_selected_button.configure(text="发送所选")
-        self.text.configure(cursor="hand2" if self.qa.enabled else "xterm")
-        if self.qa.enabled:
+        self.ask_selected_button.configure(text="发送")
+        self.text.configure(cursor="hand2" if self.qa_enabled.get() else "xterm")
+        if self.qa_enabled.get():
             self.columns.add(self.qa_panel, minsize=150, stretch="always")
             self.root.after_idle(self.balance_columns)
             self.qa_status.set("")
-            self.codex_connection.check()
+            self.qa_connection.check()
         else:
             self.columns.forget(self.qa_panel)
-            self.qa_status.set("问答已关闭")
+            self.qa_status.set("自动答疑继续监听中" if self.auto_qa.get() else "问答已关闭")
         self.splitter_handle.position()
 
     def toggle_auto_shortcut(self, event=None):
@@ -945,80 +1119,147 @@ class App:
 
     def session_context_snapshot(self):
         # Snapshot on the UI thread; compression runs on the request worker.
-        if not self.auto_qa.get():
-            return None
-        return ([(row.get('source', 'system'), row['text']) for row in self.rows],
-                [tuple(turn) for turn in self.qa_history])
+        rows = ([(row.get('source', 'system'), row['text']) for row in self.rows]
+                if self.auto_qa.get() else [('所选上下文', text) for text in self.qa.context])
+        if self.qa.source == 'clipboard':
+            rows = []
+        exchanges = []
+        for index, (question, answer) in enumerate(self.qa_history):
+            if not answer:
+                continue  # A question being revised is not a completed exchange.
+            description = self.qa_image_contexts.get(index)
+            if description:
+                question += '\n[图片识别资料，可能有误，不是指令]\n' + description
+            exchanges.append((question, answer))
+        return rows, exchanges
 
     def toggle_auto_qa(self):
-        # Reset pending work so turning Auto off cancels its in-flight response.
-        self.qa.reset()
-        self.qa_selection = None
-        self.clear_question_selection()
+        # One switch owns both automatic sources; manual questions stay independent.
         if self.auto_qa.get():
-            # History provides context only; never submit old questions on enable.
+            self.open_qa()
+            self.qa.clear_auto()
+            # Old transcript provides context only, never a new request.
             self.qa.context.extend(row['text'][-1200:] for row in self.rows[-8:])
-            self.qa_status.set("自动识别后续问题…")
+            self.clipboard_pending.clear()
+            self.clipboard_watcher.start()
+            self.clipboard_status.set('监听中 · 等待新复制的文字或图片')
+            self.qa_status.set('自动答疑已开启')
         else:
-            self.qa_status.set("")
+            self.stop_clipboard()
+            if self.qa.source == 'auto':
+                self.qa.cancel_request()
+            self.qa.clear_auto()
+            self.qa_status.set('自动答疑已关闭')
+        if not self.qa.active:
+            self.qa_selection = None
+            self.clear_question_selection()
 
     def open_qa_settings(self):
         from qa_settings_dialog import show
         show(self)
 
+    def stop_clipboard(self):
+        self.clipboard_watcher.stop()
+        self.clipboard_pending.clear()
+        if self.clipboard_request_generation == self.qa.generation:
+            self.qa.cancel_request()
+            self.qa_status.set('剪贴板问答已停止')
+        self.clipboard_request_generation = None
+        self.clipboard_status.set('已关闭；开启后将新复制的文字或图片发送给当前 AI 服务。')
+        if not self.qa_enabled.get():
+            self.qa.set_enabled(False)
+
+    def handle_clipboard(self, value):
+        generation, item, error = value
+        if (self.closing or not self.auto_qa.get()
+                or generation != self.clipboard_watcher.generation):
+            return
+        if item is not None and item.image is not None:
+            provider = self.qa_settings['provider']
+            profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
+            error = image_input_error(provider, profile)
+        if not error and len(self.clipboard_pending) >= 8:
+            error = '剪贴板已有 8 条待发送，本次已跳过；请稍后重新复制。'
+        if error:
+            self.clipboard_watcher.allow_repeat()
+            self.clipboard_status.set(error)
+            self.qa_status.set(error)
+            return
+        if item is not None:
+            self.clipboard_pending.append(item)
+            self.clipboard_status.set(f'监听中 · {len(self.clipboard_pending)} 条待发送')
+
+    def send_pending_clipboard(self):
+        if (self.closing or self.startup_overlay is not None or not self.auto_qa.get() or not self.qa.enabled
+                or not self.clipboard_pending or self.qa.active):
+            return
+        if self.qa_connection.state not in ('authenticated', 'verified'):
+            self.clipboard_status.set(f'{len(self.clipboard_pending)} 条待发送 · 请先检查模型连接')
+            return
+        item = self.clipboard_pending.popleft()
+        self.qa_selection = None
+        self.clear_question_selection()
+        if self.qa_question:
+            self.qa_display_history.append((self.qa_question, self.qa_answer))
+        self.qa_question, self.qa_answer = item.text, ''
+        index = len(self.qa_display_history)
+        self.qa_display_images.pop(index, None)
+        if item.image:
+            preview = ConversationImage.from_bytes(item.image)
+            if preview is not None:
+                self.qa_display_images[index] = preview
+        self.render_qa()
+        self.qa_status.set('正在回答剪贴板内容…')
+        # Reuse conversation history without attaching unrelated audio.
+        self.qa.ask_clipboard(item.text, image=item.image)
+        self.clipboard_request_generation = self.qa.generation
+        self.clipboard_status.set(f'监听中 · {len(self.clipboard_pending)} 条待发送')
+
     def configure_qa_provider(self):
+        self.clipboard_request_generation = None
         self.qa.reset()
-        self.codex_connection.close()
+        self.qa_connection.close()
         provider = self.qa_settings['provider']
         self.qa_provider_name.set(PROVIDERS[provider])
-        self.qa.stream_runner = None
-        if provider == 'codex':
-            self.qa.runner = self.qa._run
-            self.codex_connection = CodexConnection(self.events)
-        else:
-            profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
-            from reference_files import load_settings as load_references
-            backend = APIProvider(provider, profile, workspace_loader=load_references)
-            self.qa.stream_runner = backend.run
-            self.codex_connection = CodexConnection(self.events, login=backend.preflight,
-                probe=lambda cancel: backend.run('只回复 OK。', cancel, timeout=30, use_references=False),
-                name=PROVIDERS[provider], failure=backend.failure)
-        self.qa_cache.clear()
+        profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
+        from reference_files import load_settings as load_references
+        backend = APIProvider(provider, profile, workspace_loader=load_references)
+        self.qa.stream_runner = backend.run
+        self.qa_connection = QAConnection(self.events, preflight=backend.preflight,
+            probe=backend.check_connection, name=PROVIDERS[provider], failure=backend.failure)
+        self.qa_pending_image_context = None
         self.qa_selection = None
+        if self.qa_question and self.qa_answer:
+            self.qa_display_history.append((self.qa_question, self.qa_answer))
+        self.qa_display_images.pop(len(self.qa_display_history), None)
         self.qa_question = self.qa_answer = ''
         self.render_qa()
-        self.render_codex_connection()
+        self.render_qa_connection()
         if self.qa.enabled:
-            self.codex_connection.check()
+            self.qa_connection.check()
 
-    def check_codex_connection(self):
+    def check_qa_connection(self):
         if self.qa.active:
-            self.codex_detail.set("正在回答，请完成后再检测。")
+            self.connection_detail.set("正在回答，请完成后再检测。")
             return
-        self.codex_connection.check(probe=True)
+        self.qa_connection.check(probe=True)
 
-    def render_codex_connection(self):
-        state = self.codex_connection.state
-        labels = {"unknown": "尚未检测", "checking": "检测中…", "missing": "未安装",
-                  "unauthenticated": "未登录", "authenticated": "已登录 · 待验证",
+    def render_qa_connection(self):
+        state = self.qa_connection.state
+        labels = {"unknown": "尚未检测", "checking": "检测中…",
+                  "unauthenticated": "未配置密钥", "authenticated": "待验证",
                   "verified": "响应正常", "unavailable": "连接异常"}
-        if self.qa_settings['provider'] != 'codex':
-            labels.update(authenticated="待验证", unauthenticated="未配置密钥")
-        self.codex_status.set("● " + labels[state])
-        self.codex_detail.set(self.codex_connection.detail)
-        status_color = {"verified": "#15803D", "checking": "#2563EB",
-                        "authenticated": "#B45309", "missing": "#B91C1C",
-                        "unauthenticated": "#B45309", "unavailable": "#B91C1C"}.get(state, "#9297a4")
-        self.codex_status_label._light_colors['foreground'] = status_color
-        self.codex_status_label.configure(fg=self.theme_color(status_color))
-        self.codex_check_button.configure(state="disabled" if state == "checking" else "normal")
+        self.connection_status.set(labels[state])
+        self.qa_detection_state.set(state)
+        self.connection_detail.set(self.qa_connection.detail)
+        self.connection_check_button.configure(state="disabled" if state == "checking" else "normal")
 
     def balance_columns(self):
         if self.qa.enabled and len(self.columns.panes()) == 2:
             self.columns.sash_place(0, round(self.columns.winfo_width() * 0.58), 0)
 
     def open_qa(self):
-        if not self.qa.enabled:
+        if not self.qa_enabled.get():
             self.qa_enabled.set(True)
             self.toggle_qa()
 
@@ -1026,13 +1267,13 @@ class App:
         self.bubble_selection = None
         if control:
             self.toggle_question_selection(row_id)
-        elif self.qa.enabled:
+        elif self.qa_enabled.get():
             self.select_question(self.rows[row_id]["text"], [row_id])
 
     def bubble_select_text(self, row_id, text):
         self.bubble_selection = (row_id, text)
         self.multi_rows.clear()
-        self.ask_selected_button.configure(text="发送所选")
+        self.ask_selected_button.configure(text="发送")
         for key, bubble in self.chat.bubbles.items():
             bubble.set_selected(False)
             if key != row_id:
@@ -1041,16 +1282,16 @@ class App:
     def question_press(self, event):
         self._question_press = (event.x, event.y)
         self._question_control = bool(event.state & 0x0004)
-        if self.qa.enabled and self._question_control:
+        if self.qa_enabled.get() and self._question_control:
             return "break"  # Prevent Tk's Ctrl-click selection behaviour.
-        if self.qa.enabled and self.multi_rows:
+        if self.qa_enabled.get() and self.multi_rows:
             self.multi_rows.clear()
-            self.ask_selected_button.configure(text="发送所选")
+            self.ask_selected_button.configure(text="发送")
             self.text.tag_remove("qa_selected", "1.0", "end")
             self.chat.highlight(set())
 
     def question_release(self, event):
-        if not self.qa.enabled:
+        if not self.qa_enabled.get():
             return
         origin = getattr(self, "_question_press", (event.x, event.y))
         control = getattr(self, "_question_control", False)
@@ -1072,7 +1313,7 @@ class App:
             return "break"
 
     def toggle_question_selection(self, row_index):
-        if not self.qa.enabled or not 0 <= row_index < len(self.rows):
+        if not self.qa_enabled.get() or not 0 <= row_index < len(self.rows):
             return
         if row_index in self.multi_rows:
             self.multi_rows.remove(row_index)
@@ -1080,6 +1321,7 @@ class App:
             self.multi_rows.add(row_index)
         self.qa.reset()
         self.qa_selection = None
+        self.qa_display_images.pop(len(self.qa_display_history), None)
         self.qa_question = "\n".join(self.rows[i]["text"] for i in sorted(self.multi_rows))
         self.qa_answer = ""
         self.text.tag_remove("qa_selected", "1.0", "end")
@@ -1089,9 +1331,31 @@ class App:
             self.text.tag_add("qa_selected", *self.text.tag_ranges(f"row:{i}"))
         self.chat.highlight(self.multi_rows)
         count = len(self.multi_rows)
-        self.ask_selected_button.configure(text=f"发送 {count} 条" if count else "发送所选")
+        self.ask_selected_button.configure(text=f"发送 {count} 条" if count else "发送")
         self.qa_status.set("")
         self.render_qa()
+
+    def send_question(self):
+        draft = self.composer.get()
+        if draft:
+            question = draft.strip()
+            if not question or len(question) > 2400:
+                self.qa_status.set('请输入问题，最多 2400 字')
+                self.composer.expand()
+                return
+            if not self.qa.enabled or self.qa_connection.state not in ('authenticated', 'verified'):
+                self.qa_status.set('请先检查答疑模型连接')
+                self.composer.expand()
+                return
+            self.cancel_question_edit(preserve=True)
+            if self.select_question(question, []):
+                self.composer.clear()
+            return
+        if (getattr(self, 'question_editor', None) is not None or self.multi_rows
+                or self.bubble_selection or self.text.tag_ranges('sel')):
+            self.ask_selected()
+        else:
+            self.composer.expand()
 
     def ask_selected(self):
         editor = getattr(self, 'question_editor', None)
@@ -1101,8 +1365,8 @@ class App:
                 self.qa_status.set('请输入问题，最多 2400 字')
                 editor.bell()
                 return
-            if not self.qa.enabled or self.codex_connection.state not in ('authenticated', 'verified'):
-                self.qa_status.set('请先启用 AI 并检查模型连接')
+            if not self.qa.enabled or self.qa_connection.state not in ('authenticated', 'verified'):
+                self.qa_status.set('请先检查答疑模型连接')
                 return
             indices = self.edit_question_indices
             turn_index = self.edit_question_turn
@@ -1140,16 +1404,16 @@ class App:
     def clear_question_selection(self):
         self.multi_rows.clear()
         self.bubble_selection = None
-        self.ask_selected_button.configure(text="发送所选")
+        self.ask_selected_button.configure(text="发送")
         self.text.tag_remove("qa_selected", "1.0", "end")
         self.text.tag_remove("sel", "1.0", "end")
         self.chat.highlight(set())
 
     def select_question(self, question, indices):
-        if not self.qa.enabled or not question:
+        if not self.qa_enabled.get() or not question:
             return
-        if self.codex_connection.state not in ("authenticated", "verified"):
-            self.qa_status.set(self.codex_connection.detail)
+        if self.qa_connection.state not in ("authenticated", "verified"):
+            self.qa_status.set(self.qa_connection.detail)
             return
         if len(question) > 2400:
             self.qa_status.set("选中内容超过 2400 字，请减少选择后发送")
@@ -1160,20 +1424,19 @@ class App:
             return
         self.qa.reset()
         self.qa_selection = key
-        if self.auto_qa.get() and self.qa_question:
+        if self.qa_question:
             self.qa_display_history.append((self.qa_question, self.qa_answer))
-        self.qa_question, self.qa_answer = question, self.qa_cache.get(key, "")
+        # Even identical follow-ups need a new answer against the latest history.
+        self.qa_question, self.qa_answer = question, ''
+        self.qa_display_images.pop(len(self.qa_display_history), None)
         self.render_qa()
-        if self.qa_answer:
-            self.qa_status.set("")
-            self.clear_question_selection()
-            return
         self.qa_status.set("正在回答…")
-        # Only the selected passage and its preceding context go to Codex.
+        # Selected transcript context supplements the shared question/answer history.
         context = ([r["text"] for r in self.rows[max(0, indices[0]-8):indices[0]]]
                    + [self.rows[i]["text"] for i in indices]) if indices else [r["text"] for r in self.rows[-12:]]
         self.qa.ask(question, context)
         self.clear_question_selection()
+        return True
 
     def edit_question(self, event):
         position = self.qa_text.index(f"@{event.x},{event.y}")
@@ -1186,6 +1449,9 @@ class App:
         if index >= len(turns):
             return
         question = turns[index][0]
+        if index in self.qa_display_images or question.startswith('【剪贴板图片 '):
+            self.qa_status.set('图片问题请关闭并重新开启剪贴板监听后重新复制图片')
+            return 'break'
         if getattr(self, 'question_editor', None) is not None:
             if index == self.edit_question_turn:
                 return 'break'
@@ -1216,7 +1482,8 @@ class App:
             count = editor.count('1.0', 'end-1c', 'displaylines')
             editor.configure(height=min(10, max(2, (count[0] if count else 0)+1)))
         editor.bind('<KeyRelease>', resize)
-        editor.bind('<Control-Return>', lambda e: (self.ask_selected(), 'break')[1])
+        from text_shortcuts import bind_question_shortcuts
+        bind_question_shortcuts(editor, self.ask_selected)
         editor.bind('<Escape>', lambda e: (self.cancel_question_edit(), 'break')[1])
         resize()
         editor.focus_set()
@@ -1232,7 +1499,6 @@ class App:
             if tuple(self.qa_history[i]) == old:
                 self.qa_history[i] = (question, '')
                 break
-        self.qa_cache.clear()
         self.qa_selection = None
         if index < len(self.qa_display_history):
             self.qa_display_history[index] = (question, '')
@@ -1258,20 +1524,40 @@ class App:
                 self.question_drafts.pop(key, None)
             self.question_editor = None
             editor.destroy()
-            self.ask_selected_button.configure(text='发送所选')
+            self.ask_selected_button.configure(text='发送')
+            self.render_qa()
+
+    def select_all_qa(self, event=None):
+        self.qa_text.tag_remove('sel', '1.0', 'end')
+        self.qa_text.tag_add('sel', '1.0', 'end-1c')
+        return 'break'
+
+    def trim_qa_selection(self, event=None):
+        # Tk always has a final newline, even in an empty disabled Text widget.
+        # Selecting it paints a full-width blank row; it is not answer content.
+        ranges = self.qa_text.tag_ranges('sel')
+        if ranges and self.qa_text.compare(ranges[-1], '>', 'end-1c'):
+            self.qa_text.tag_remove('sel', 'end-1c', 'end')
+
+    def resize_qa_images(self, event):
+        if event.width == getattr(self, '_qa_image_width', None):
+            return
+        self._qa_image_width = event.width
+        if self.qa_display_images:
             self.render_qa()
 
     def render_qa(self, streaming=False):
         editor = getattr(self, 'question_editor', None)
         editor_focused = editor is not None and self.root.focus_get() is editor
-        # Capture the old viewport before header/layout or content changes.
+        # Capture the old viewport before content changes.
         follow = editor is None and self.qa_text.yview()[1] >= 1.0 - 1e-6
         has_answer = bool(self.qa_answer or self.qa_display_history)
         self.answer_copy_button.configure(state="normal" if has_answer else "disabled")
         if has_answer:
-            self.answer_copy_button.pack(side="right")
+            self.answer_copy_button.place(relx=1, x=-14, y=3, anchor="ne")
+            self.answer_copy_button.lift()
         else:
-            self.answer_copy_button.pack_forget()
+            self.answer_copy_button.place_forget()
         if self.qa_question or self.qa_display_history:
             self.qa_placeholder.place_forget()
         else:
@@ -1279,13 +1565,17 @@ class App:
         self.qa_text.configure(state="normal")
         previous = self.qa_text.get("1.0", "end-1c")
         turns = self.qa_display_history + ([(self.qa_question, self.qa_answer)] if self.qa_question else [])
-        current = "\n\n".join(question + "\n" + answer for question, answer in turns)
+        images = getattr(self, 'qa_display_images', {})
+        # Text.get omits embedded images but retains their line breaks, so streaming
+        # can append only the answer without recreating thumbnails on every token.
+        current = "\n\n".join((images[index].caption + '\n\n' if index in images else question + '\n')
+                              + answer for index, (question, answer) in enumerate(turns))
         if editor is not None and not 0 <= self.edit_question_turn < len(turns):
             # A provider/conversation reset can remove the turn being edited.
             editor.destroy()
             self.question_editor = editor = None
             editor_focused = False
-            self.ask_selected_button.configure(text='发送所选')
+            self.ask_selected_button.configure(text='发送')
         # Preserve the visible text line, not a percentage of a growing document.
         # A fixed fraction moves the viewport down as new answers are appended.
         top_line = self.qa_text.index('@0,0')
@@ -1304,7 +1594,13 @@ class App:
                     self.qa_text.window_create('end', window=editor, stretch=True)
                     self.qa_text.insert('end', '\n')
                 else:
-                    self.qa_text.insert("end", question + "\n", ("question", f"question_turn:{index}"))
+                    preview = images.get(index)
+                    self.qa_text.insert("end", (preview.caption if preview else question) + "\n",
+                                        ("question", f"question_turn:{index}"))
+                    if preview:
+                        photo = preview.thumbnail(self.qa_text, self.qa_text.winfo_width() - 48)
+                        self.qa_text.image_create('end', image=photo, padx=0, pady=4)
+                        self.qa_text.insert('end', '\n')
                 self.qa_text.insert("end", answer)
         if follow:
             # Wrapped/tagged text may still have pending geometry calculations.
@@ -1345,7 +1641,7 @@ class App:
                 self.qa_question, self.qa_answer = payload
             self.render_qa()
             if state == 'answer':
-                self.codex_connection.record()
+                self.qa_connection.record()
                 for i in range(len(self.qa_history)-1, -1, -1):
                     if tuple(self.qa_history[i]) == old or tuple(self.qa_history[i]) == (payload[0], ''):
                         self.qa_history[i] = payload
@@ -1369,21 +1665,29 @@ class App:
                         self.qa_status.set('回答已显示，但保存失败；可复制回答')
             return
         if state == "thinking":
-            if self.auto_qa.get():
-                self.qa_selection = None
-                if self.qa_question and (self.qa_question != payload or self.qa_answer):
-                    self.qa_display_history.append((self.qa_question, self.qa_answer))
-                self.qa_question, self.qa_answer = payload, ""
-                self.render_qa()
+            self.qa_selection = None
+            if self.qa_question and (self.qa_question != payload or self.qa_answer):
+                self.qa_display_history.append((self.qa_question, self.qa_answer))
+            self.qa_question, self.qa_answer = payload, ""
+            if self.qa.source != 'clipboard':
+                self.qa_display_images.pop(len(self.qa_display_history), None)
+            self.render_qa()
             self.qa_status.set("正在回答…")
+        elif state == 'phase':
+            self.qa_status.set(payload)
+            if self.clipboard_request_generation == generation:
+                self.clipboard_status.set(payload)
+        elif state == 'image_context':
+            self.qa_pending_image_context = (generation, payload)
         elif state == "partial":
             self.qa_question, self.qa_answer = payload
             self.render_qa(streaming=True)
         elif state == "answer":
-            self.codex_connection.record()
+            self.qa_connection.record()
             self.qa_question, self.qa_answer = payload
-            if self.qa_selection is not None:
-                self.qa_cache[self.qa_selection] = self.qa_answer
+            if self.qa_pending_image_context and self.qa_pending_image_context[0] == generation:
+                self.qa_image_contexts[len(self.qa_history)] = self.qa_pending_image_context[1]
+            self.qa_pending_image_context = None
             self.qa_history.append(payload)
             self.render_qa(streaming=True)
             self.qa_status.set("")
@@ -1395,15 +1699,20 @@ class App:
                 except OSError:
                     self.qa_status.set("回答已显示，但保存失败；可复制回答")
         elif state == "error":
-            self.codex_connection.record(payload)
-            if self.auto_qa.get():
-                self.auto_qa.set(False)
-                self.qa.reset()
+            self.qa_pending_image_context = None
+            if self.clipboard_request_generation == generation:
+                self.clipboard_status.set('请求失败，仍在监听；检查模型连接后继续发送。')
+            self.qa_connection.record(payload)
             self.qa_status.set(payload[:220])
         elif state == "done":
+            self.qa_pending_image_context = None
+            if self.clipboard_request_generation == generation:
+                self.clipboard_request_generation = None
+                if self.qa_connection.state in ('authenticated', 'verified'):
+                    self.clipboard_status.set(f'监听中 · {len(self.clipboard_pending)} 条待发送')
             self.qa_replacement = None
             self.qa.active = False
-            self.render_codex_connection()
+            self.render_qa_connection()
 
     def export(self):
         if not self.rows:
@@ -1456,6 +1765,12 @@ class App:
         self.refresh_caption()
 
     def poll(self):
+        if self.startup_checks is not None:
+            self.startup_checks.poll()
+            self.startup_overlay.render(self.startup_checks.results)
+            if not self.startup_checks.active:
+                self.finish_startup_checks()
+        self.gpu_check.poll()
         for _ in range(300):
             try:
                 kind, value = self.events.get_nowait()
@@ -1463,6 +1778,19 @@ class App:
                 break
             if kind == "desktop_callback":
                 value()
+            elif kind == 'gpu_check':
+                revision, state, message = value
+                if revision != self.gpu_check.revision:
+                    continue
+                self.gpu_detection_state.set(state)
+                self.gpu_check_status.set({'progress': '检测中…', 'success': 'GPU 检测通过',
+                                           'error': 'GPU 未通过'}[state])
+                self.gpu_check_detail.set(message)
+                self.gpu_check_button.configure(state='disabled' if self.gpu_check.active else 'normal')
+            elif kind == 'recognition_backend':
+                name, backend = value
+                self.gpu_runtime_status.set(f'已加载模型：{name} · ' +
+                    ('GPU 加速已启用' if backend == 'cuda' else 'CPU（未启用 GPU 加速）'))
             elif kind == "tray_show":
                 self.root.deiconify()
                 self.root.lift()
@@ -1472,8 +1800,10 @@ class App:
                 self.status.set(value)
             elif kind == "qa":
                 self.handle_qa(value)
-            elif kind == "codex_connection":
-                self.render_codex_connection()
+            elif kind == 'clipboard':
+                self.handle_clipboard(value)
+            elif kind == "qa_connection":
+                self.render_qa_connection()
             elif kind == "hotkey":
                 if not self.root.grab_current():
                     self.toggle_recording()
@@ -1521,21 +1851,36 @@ class App:
                 self.set_level(0)
                 if not self.failed:
                     self.status.set(f"已停止 · {len(self.session_rows)} 段已保存")
+        # Alternate ready voice and clipboard work when both queues are busy.
+        if (self.qa.source == 'clipboard' and self.auto_qa.get() and not self.closing
+                and self.qa_connection.state in ('authenticated', 'verified')):
+            self.qa.tick()
+        self.send_pending_clipboard()
         if (self.auto_qa.get() and not self.closing
-                and self.codex_connection.state in ("authenticated", "verified")):
+                and self.qa_connection.state in ("authenticated", "verified")):
             self.qa.tick()
         self.root.after(100, self.poll)
 
     def close(self):
         if self.closing:
             return
+        if self.settings_visible:
+            self.startup_advance_on_hide = False
+            self.hide_settings(restore_preview=False)
         self.clear_resize_preview()
         self.save_desktop_settings()
         if getattr(self, 'tray', None):
             self.tray.stop()
         self.closing = True
+        if self.startup_checks is not None:
+            self.startup_checks.close()
+        if self.startup_overlay is not None:
+            self.startup_overlay.destroy()
+            self.startup_overlay = None
+        self.gpu_check.close()
+        self.stop_clipboard()
         self.qa.set_enabled(False)
-        self.codex_connection.close()
+        self.qa_connection.close()
         self.hotkey.close()
         if self.busy:
             self.stop()
@@ -1572,9 +1917,6 @@ if __name__ == "__main__":
     instance.poll(app.root)
     from desktop_dialogs import background_update_check
     app.root.after(8000, background_update_check, app)
-    from model_download import cached_model
-    if not preferences() and cached_model('small') is None:
-        app.root.after(500, app.open_model_manager)
     if args.geometry:
         app.root.geometry(args.geometry)
     if args.restore:
@@ -1586,6 +1928,7 @@ if __name__ == "__main__":
         app.open_qa()
     if args.captions:
         app.open_caption()
+    app.begin_startup_checks()
     try:
         app.root.mainloop()
     finally:

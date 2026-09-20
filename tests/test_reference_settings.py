@@ -10,7 +10,7 @@ class ReferenceSettingsTests(unittest.TestCase):
     def test_add_persist_remove_without_deleting_source(self):
         data = {'enabled': False, 'paths': []}
         with tempfile.TemporaryDirectory() as directory, patch('app.GlobalHotkey'), \
-                patch('app.App.start_tray'), patch('codex_connection.CodexConnection.check'), \
+                patch('app.App.start_tray'), patch('qa_connection.QAConnection.check'), \
                 patch('reference_settings.load_settings', return_value=dict(data)), \
                 patch('reference_settings.save_settings') as save:
             file = Path(directory)/'manual.md'
@@ -48,6 +48,7 @@ class ReferenceSettingsTests(unittest.TestCase):
                 controls['remove']()
                 self.assertEqual(controls['listing'].size(), 0)
                 self.assertEqual(app.reference_path_label.paths, [])
+                app.settings_save_button.invoke()
                 self.assertEqual(save.call_args.args[0]['paths'], [])
                 self.assertTrue(file.exists())
                 # Each path's hover action removes only its own reference.
@@ -73,7 +74,7 @@ class ReferenceSettingsTests(unittest.TestCase):
                 self.assertEqual(app.settings_window.winfo_width(), 480)
             finally:
                 app.qa.set_enabled(False)
-                app.codex_connection.close()
+                app.qa_connection.close()
                 app.hotkey.close()
                 for timer in root.tk.call('after', 'info'):
                     root.after_cancel(timer)

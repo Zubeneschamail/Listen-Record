@@ -1,9 +1,8 @@
 import queue
-import subprocess
 import threading
 import unittest
-from unittest.mock import Mock, patch
-from codex_connection import CodexConnection, login_status, request_failure
+from unittest.mock import Mock
+from qa_connection import QAConnection, request_failure
 
 
 class ConnectionTests(unittest.TestCase):
@@ -13,28 +12,16 @@ class ConnectionTests(unittest.TestCase):
             if connection.state != 'checking':
                 return connection.state
 
-    def test_login_detection_and_missing_install(self):
-        with patch('codex_connection.find_codex', side_effect=RuntimeError('missing')):
-            self.assertEqual(login_status()[0], 'missing')
-        with patch('codex_connection.find_codex', return_value='codex.exe'), \
-             patch('codex_connection.subprocess.run') as run:
-            run.return_value = subprocess.CompletedProcess([], 0, '', 'Logged in using ChatGPT')
-            self.assertEqual(login_status()[0], 'authenticated')
-            run.return_value = subprocess.CompletedProcess([], 1, '', 'Not logged in')
-            self.assertEqual(login_status()[0], 'unauthenticated')
-            run.side_effect = subprocess.TimeoutExpired('codex', 8)
-            self.assertEqual(login_status()[0], 'unavailable')
-
     def test_automatic_check_never_sends_prompt(self):
         events, probe = queue.Queue(), Mock(return_value='OK')
-        connection = CodexConnection(events, lambda: ('authenticated', 'logged in'), probe)
+        connection = QAConnection(events, lambda: ('authenticated', 'configured'), probe)
         connection.check()
         self.assertEqual(self.wait_result(connection, events), 'authenticated')
         probe.assert_not_called()
 
     def test_manual_check_requires_successful_response(self):
         events, probe = queue.Queue(), Mock(return_value='OK')
-        connection = CodexConnection(events, lambda: ('authenticated', 'logged in'), probe)
+        connection = QAConnection(events, lambda: ('authenticated', 'configured'), probe)
         connection.check(probe=True)
         self.assertEqual(self.wait_result(connection, events), 'verified')
         probe.assert_called_once()
@@ -42,9 +29,9 @@ class ConnectionTests(unittest.TestCase):
         connection.check(probe=True)
         self.assertEqual(self.wait_result(connection, events), 'unauthenticated')
 
-    def test_missing_login_blocks_probe(self):
+    def test_missing_key_blocks_probe(self):
         events, probe = queue.Queue(), Mock()
-        connection = CodexConnection(events, lambda: ('unauthenticated', 'login first'), probe)
+        connection = QAConnection(events, lambda: ('unauthenticated', 'configure key first'), probe)
         connection.check(probe=True)
         self.assertEqual(self.wait_result(connection, events), 'unauthenticated')
         probe.assert_not_called()
@@ -56,7 +43,7 @@ class ConnectionTests(unittest.TestCase):
             release.wait(2)
             finished.set()
             return 'OK'
-        connection = CodexConnection(events, lambda: ('authenticated', 'logged in'), probe)
+        connection = QAConnection(events, lambda: ('authenticated', 'configured'), probe)
         connection.check(probe=True)
         self.assertTrue(started.wait(2))
         old = connection.revision

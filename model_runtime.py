@@ -22,21 +22,28 @@ def prepare_cuda():
             # CTranslate2 uses native LoadLibrary, which also needs the process PATH.
             os.environ['PATH'] = str(directory) + os.pathsep + os.environ.get('PATH', '')
 
+def cuda_runtime_errors():
+    """Return failing library names and loader errors, including dependencies."""
+    if os.name != 'nt' or _CUDA_LIBRARIES:
+        return []
+    import ctypes
+    libraries, errors = [], []
+    for name in ('cublasLt64_12.dll', 'cublas64_12.dll', 'cudnn64_9.dll'):
+        try:
+            libraries.append(ctypes.WinDLL(name))
+        except OSError as exc:
+            errors.append(f'{name}：{exc}')
+    if not errors:
+        _CUDA_LIBRARIES.extend(libraries)
+    return errors
+
+
 def cuda_runtime_available():
     """Do not initialize a CUDA model when its delayed-load libraries are absent."""
-    if os.name != 'nt':
-        return True
-    if _CUDA_LIBRARIES:
-        return True
-    import ctypes
-    try:
-        libraries = [ctypes.WinDLL(name) for name in
-                     ('cublasLt64_12.dll', 'cublas64_12.dll', 'cudnn64_9.dll')]
-    except OSError:
-        logging.info('CUDA runtime unavailable; using CPU without initializing a GPU model')
-        return False
-    _CUDA_LIBRARIES.extend(libraries)
-    return True
+    errors = cuda_runtime_errors()
+    if errors:
+        logging.info('CUDA runtime unavailable; using CPU: %s', '; '.join(errors))
+    return not errors
 
 
 def load_model(name, device='auto', status=None):
@@ -63,7 +70,10 @@ def load_model(name, device='auto', status=None):
         return create('cpu')
     try:
         prepare_cuda()
-        if ctranslate2.get_cuda_device_count() and cuda_runtime_available():
+        count = ctranslate2.get_cuda_device_count()
+        if device == 'cuda' and count and (errors := cuda_runtime_errors()):
+            raise RuntimeError('CUDA 运行库加载失败：' + '; '.join(errors))
+        if count and cuda_runtime_available():
             return create('cuda')
         if device == 'cuda':
             raise RuntimeError('未检测到 CUDA 显卡')

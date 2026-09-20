@@ -39,12 +39,12 @@ def terms(text):
     return words
 
 
-def build_context(rows, exchanges, question):
+def build_context(rows, exchanges, question, budget=CONTEXT_BYTES):
     transcripts = [f'[转写 {i+1} / {source}] {text}' for i, (source, text) in enumerate(rows)]
     answers = [f'[问答 {i+1}] 用户问题：{q}\nAI 回复（非已确认事实）：{a}'
                for i, (q, a) in enumerate(exchanges)]
     full = {'模式': '完整会话', '全部转写': transcripts, '历史问答': answers}
-    if len(encoded(full).encode('utf-8')) <= CONTEXT_BYTES:
+    if len(encoded(full).encode('utf-8')) <= budget:
         return full
     old_text, recent_text = recent(transcripts, 12000)
     old_answers, recent_answers = recent(answers, 10000)
@@ -77,8 +77,42 @@ def build_context(rows, exchanges, question):
               '相关早期原文摘录': clip('\n'.join(relevant), 6000),
               '近期转写原文': recent_text, '近期问答原文': recent_answers}
     # Bound serialized bytes too, including escaped characters and JSON overhead.
-    while len(encoded(result).encode('utf-8')) > CONTEXT_BYTES:
+    while len(encoded(result).encode('utf-8')) > budget:
         key = max(('早期摘要', '相关早期原文摘录', '近期转写原文', '近期问答原文'),
                   key=lambda k: len(result[k].encode('utf-8')))
         result[key] = clip(result[key], max(0, len(result[key].encode('utf-8'))-1000))
     return result
+
+
+def build_conversation(rows, exchanges, question):
+    """Keep actual user/assistant roles; summarize only older overflow turns."""
+    pairs = [[{'role': 'user', 'content': q}, {'role': 'assistant', 'content': a}]
+             for q, a in exchanges]
+    background = {'模式': '完整会话', '全部转写':
+                  [f'[转写 {i+1} / {source}] {text}' for i, (source, text) in enumerate(rows)]}
+    messages = [message for pair in pairs for message in pair]
+    if len(encoded([background, messages]).encode('utf-8')) <= CONTEXT_BYTES:
+        return background, messages
+
+    selected, size = [], 0
+    for pair in reversed(pairs):
+        cost = len(encoded(pair).encode('utf-8')) + 1
+        if size + cost > 18000:
+            if not selected:
+                pair = [dict(message) for message in pair]
+                while len(encoded(pair).encode('utf-8')) > 17000:
+                    message = max(pair, key=lambda m: len(m['content'].encode('utf-8')))
+                    text = message['content']
+                    limit = max(20, len(text.encode('utf-8')) * 3 // 8)
+                    message['content'] = clip(text, limit) + '\n[部分省略]\n' + clip(text, limit, tail=True)
+                selected.append(pair)
+            break
+        selected.append(pair)
+        size += cost
+    selected.reverse()
+    messages = [message for pair in selected for message in pair]
+    older = exchanges[:len(exchanges)-len(selected)]
+    background = build_context(rows, older, question,
+        budget=CONTEXT_BYTES-len(encoded(messages).encode('utf-8'))-256)
+    background['模式'] = '早期资料与转写摘要；近期问答见对话消息'
+    return background, messages

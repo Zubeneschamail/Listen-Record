@@ -4,9 +4,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from desktop_dialogs import dialog
 from qa_provider import DEFAULTS, PROVIDERS, endpoint, save_settings
+from ui_components import guard_combo_wheel
 
 
-def show(app):
+def show(app, initial_provider=None, on_close=None, initial_error=None):
     existing = getattr(app, 'qa_settings_window', None)
     if existing is not None and existing.winfo_exists():
         existing.lift()
@@ -15,7 +16,7 @@ def show(app):
     app.qa_settings_window = window
     window.transient(app.settings_window)
     drafts = copy.deepcopy(app.qa_settings['profiles'])
-    active = [app.qa_settings['provider']]
+    active = [initial_provider or app.qa_settings['provider']]
     provider = tk.StringVar(value=PROVIDERS[active[0]])
     base = tk.StringVar()
     model = tk.StringVar()
@@ -23,6 +24,7 @@ def show(app):
     help_text = tk.StringVar()
     ttk.Label(window, text='问答服务').grid(row=0, column=0, sticky='w', padx=(0, 16))
     selector = ttk.Combobox(window, textvariable=provider, values=list(PROVIDERS.values()), state='readonly', width=38)
+    guard_combo_wheel(selector)
     selector.grid(row=0, column=1, sticky='ew')
     fields = ttk.Frame(window)
     fields.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(12, 0))
@@ -32,6 +34,7 @@ def show(app):
     address.grid(row=0, column=1, sticky='ew')
     ttk.Label(fields, text='模型名称').grid(row=1, column=0, sticky='w', pady=10)
     models = ttk.Combobox(fields, textvariable=model, width=40)
+    guard_combo_wheel(models)
     models.grid(row=1, column=1, sticky='ew', pady=10)
     ttk.Label(fields, text='API Key').grid(row=2, column=0, sticky='w')
     ttk.Entry(fields, textvariable=key, show='•', width=42, style='Settings.TEntry').grid(row=2, column=1, sticky='ew')
@@ -49,14 +52,9 @@ def show(app):
         key.set(values.get('api_key', ''))
         models.configure(values=('deepseek-flash', 'deepseek-v4-pro') if name == 'deepseek' else ())
         address.configure(state='readonly' if name == 'deepseek' else 'normal')
-        if name == 'codex':
-            fields.grid_remove()
-            help_text.set('使用本机已登录的 Codex CLI，无需填写 API Key。')
-        else:
-            fields.grid()
-            help_text.set(('流式回答，关闭深度思考以优先响应速度。\n' if name == 'deepseek' else
-                           '支持 OpenAI Chat Completions 流式接口。\n地址需包含服务商要求的路径，例如 /v1。\n') +
-                          'API Key 仅加密保存在本机。请求按服务商规则计费。')
+        help_text.set(('Pro 图片答疑先由 Flash 读图，共计两次模型调用。\n' if name == 'deepseek' else
+                       '支持 Chat Completions 接口，地址按服务商要求填写（如 /v1）。\n') +
+                      'API Key 加密保存在本机，调用按服务商计费。')
         app.root.after_idle(app.apply_theme)
 
     def changed(event=None):
@@ -71,15 +69,16 @@ def show(app):
         window.destroy()
         if app.settings_window.winfo_viewable():
             app.settings_window.grab_set()
+        if on_close:
+            app.root.after_idle(on_close)
 
     def save():
         stash()
         name = active[0]
         try:
-            if name != 'codex':
-                endpoint(drafts[name]['base_url'])
-                if not drafts[name]['model'] or not drafts[name]['api_key']:
-                    raise ValueError('请填写模型名称和 API Key。')
+            endpoint(drafts[name]['base_url'])
+            if not drafts[name]['model'] or not drafts[name]['api_key']:
+                raise ValueError('请填写模型名称和 API Key。')
             settings = {'provider': name, 'profiles': drafts}
             save_settings(settings)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -101,6 +100,8 @@ def show(app):
     ttk.Button(actions, text='保存', command=save).pack(side='left')
     window.protocol('WM_DELETE_WINDOW', close)
     populate()
+    if initial_error:
+        help_text.set('启动检测未通过：' + initial_error[:300] + '\n请检查服务配置并保存，再重新检测。')
     window.update_idletasks()
     parent = app.settings_window
     x = max(0, parent.winfo_rootx() + (parent.winfo_width() - window.winfo_reqwidth()) // 2)

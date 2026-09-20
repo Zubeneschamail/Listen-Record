@@ -11,7 +11,7 @@ from app import App
 class AutoQATests(unittest.TestCase):
     def test_restart_preserves_conversation_and_f12_toggles_auto(self):
         with patch('app.GlobalHotkey'), patch('app.App.start_tray'), \
-                patch('codex_connection.CodexConnection.check'):
+                patch('qa_connection.QAConnection.check'), patch('app.ClipboardWatcher'):
             root = tk.Tk()
             app = App(root)
             try:
@@ -58,7 +58,7 @@ class AutoQATests(unittest.TestCase):
                     self.assertEqual(app.qa_text.get('1.0', 'end-1c'), '')
             finally:
                 app.qa.set_enabled(False)
-                app.codex_connection.close()
+                app.qa_connection.close()
                 app.hotkey.close()
                 for timer in root.tk.call('after', 'info'):
                     root.after_cancel(timer)
@@ -66,13 +66,13 @@ class AutoQATests(unittest.TestCase):
 
     def test_auto_context_new_questions_and_disable_cancellation(self):
         with patch('app.GlobalHotkey'), patch('app.App.start_tray'), \
-                patch('codex_connection.CodexConnection.check'):
+                patch('qa_connection.QAConnection.check'), patch('app.ClipboardWatcher'):
             root = tk.Tk()
             app = App(root)
             try:
                 app.qa_enabled.set(True)
                 app.toggle_qa()
-                app.codex_connection.state = 'authenticated'
+                app.qa_connection.state = 'authenticated'
                 app.rows = [{'text': '我们正在讨论机器学习。'}, {'text': '旧问题是什么？'}]
                 app.auto_qa.set(True)
                 app.toggle_auto_qa()
@@ -124,7 +124,7 @@ class AutoQATests(unittest.TestCase):
                 app.auto_qa.set(True)
                 app.qa_enabled.set(False)
                 app.toggle_qa()
-                self.assertFalse(app.auto_qa.get())
+                self.assertTrue(app.auto_qa.get())
                 app.clear()
                 self.assertEqual(app.qa_history, [])
                 self.assertEqual(app.rows, [])
@@ -132,7 +132,7 @@ class AutoQATests(unittest.TestCase):
                 self.assertEqual(app.qa_text.get('1.0', 'end-1c'), '')
             finally:
                 app.qa.set_enabled(False)
-                app.codex_connection.close()
+                app.qa_connection.close()
                 app.hotkey.close()
                 for timer in root.tk.call('after', 'info'):
                     root.after_cancel(timer)

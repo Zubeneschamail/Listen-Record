@@ -15,7 +15,7 @@ class IconButton(tk.Button):
                        for name in (icon, 'check')}
         original = Image.open(ICONS / f'{icon}.png').convert('RGBA')
         self.neutral_images = {}
-        if icon in ('settings', 'copy', 'close', 'minimize', 'more', 'add'):
+        if icon in ('settings', 'copy', 'close', 'minimize', 'more', 'add', 'collapse'):
             for tone in ('#737b8c', '#AEBBCD'):
                 variants = {}
                 for name in (icon, 'check'):
@@ -134,3 +134,50 @@ class IconButton(tk.Button):
         if self.tooltip_window:
             self.tooltip_window.destroy()
             self.tooltip_window = None
+
+
+class IconToggle(IconButton):
+    """A themed on/off icon using the same hover description as other buttons."""
+    _custom_theme = True
+
+    def __init__(self, parent, icon, text, variable, command, surface='white'):
+        self.variable, self.on_change = variable, command
+        self.surface = surface
+        self.dark, self.hover = False, False
+        super().__init__(parent, icon, text=text, command=self.toggle,
+                         relief='flat', bd=0, cursor='hand2', takefocus=True)
+        source = Image.open(ICONS / f'{icon}.png').convert('RGBA')
+        self.toggle_images = {}
+        for tone in ('#737b8c', '#AEBBCD', '#007ACC', '#60A5FA'):
+            tinted = Image.new('RGBA', source.size, tone)
+            tinted.putalpha(source.getchannel('A'))
+            self.toggle_images[tone] = ImageTk.PhotoImage(tinted, master=self)
+        self.trace = variable.trace_add('write', lambda *_: self.draw_toggle())
+        self.bind('<Enter>', lambda e: self.set_hover(True), add='+')
+        self.bind('<Leave>', lambda e: self.set_hover(False), add='+')
+        self.bind('<Return>', lambda e: self.invoke(), add='+')
+        self.bind('<Destroy>', self.cleanup_toggle, add='+')
+        self.apply_theme(False)
+
+    def toggle(self):
+        self.variable.set(not self.variable.get())
+        self.on_change()
+
+    def set_hover(self, value):
+        self.hover = value
+        self.draw_toggle()
+
+    def apply_theme(self, dark):
+        self.dark = dark
+        self.draw_toggle()
+
+    def draw_toggle(self):
+        from theme import color
+        active = self.variable.get()
+        tone = ('#60A5FA' if self.dark else '#007ACC') if active else ('#AEBBCD' if self.dark else '#737b8c')
+        tk.Button.configure(self, image=self.toggle_images[tone], bg=color('#EDF5FB' if self.hover else self.surface, self.dark),
+                            activebackground=color('#E6F2FB', self.dark), highlightcolor=color('#007ACC', self.dark))
+
+    def cleanup_toggle(self, event):
+        if event.widget is self:
+            self.variable.trace_remove('write', self.trace)

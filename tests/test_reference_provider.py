@@ -4,7 +4,7 @@ import tempfile
 import threading
 import unittest
 import httpx
-from codex_qa import make_prompt
+from qa_worker import make_prompt
 from qa_provider import APIProvider
 
 
