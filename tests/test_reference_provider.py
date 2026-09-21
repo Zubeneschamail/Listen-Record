@@ -113,7 +113,9 @@ class ReferenceProviderTests(unittest.TestCase):
                 body = json.loads(request.content)
                 requests.append(body)
                 if len(requests) == 1:
-                    self.assertEqual(len(body['tools']), 3)
+                    self.assertEqual({tool['function']['name'] for tool in body['tools']}, {
+                        'list_reference_files', 'search_reference_files', 'read_reference_file',
+                        'search_web', 'read_webpage'})
                     return httpx.Response(200, text=chunk({'tool_calls': [{'index': 0, 'id': 'read1', 'type': 'function',
                         'function': {'name': 'read_reference_file', 'arguments': '{"path":'}}]})+
                         chunk({'tool_calls': [{'index': 0, 'function': {'arguments': '"r1/spec.txt"}'}}]}, 'tool_calls'))
@@ -130,10 +132,14 @@ class ReferenceProviderTests(unittest.TestCase):
             self.assertIn('正在查阅参考资料…', partials)
             self.assertNotIn(str(file), json.dumps(requests, ensure_ascii=False))
 
-    def test_probe_and_disabled_references_never_expose_tools_or_paths(self):
+    def test_probe_disables_tools_and_disabled_references_leave_only_web_tools(self):
         for enabled, probe in ((True, True), (False, False)):
             def handler(request):
-                self.assertNotIn('tools', json.loads(request.content))
+                body = json.loads(request.content)
+                if probe:
+                    self.assertNotIn('tools', body)
+                else:
+                    self.assertEqual({tool['function']['name'] for tool in body['tools']}, {'search_web', 'read_webpage'})
                 return httpx.Response(200, text=chunk({'content': 'OK'}, 'stop'))
             backend = APIProvider('deepseek', dict(base_url='https://example.com', model='test', api_key='fake'),
                 httpx.MockTransport(handler), lambda: {'enabled': enabled, 'paths': []})

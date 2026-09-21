@@ -78,7 +78,7 @@ class ToolMarkupTests(unittest.TestCase):
             partials = []
             response = ''.join(chunk({'content': char}) for char in raw)+chunk({}, 'stop')
             with patch('qa_provider.time.monotonic', side_effect=iter(range(10000))), self.assertRaisesRegex(RuntimeError, '工具指令格式无效'):
-                self.backend(lambda request: httpx.Response(200, text=response)).run('hello', threading.Event(), partials.append, timeout=10000)
+                self.backend(lambda request: httpx.Response(200, text=response)).run('hello', threading.Event(), partials.append, timeout=10000, use_references=False)
             self.assertEqual(partials, [])
         for text in ('x < 3', '<div>普通 HTML 示例</div>', '使用 DSML 的含义是什么？'):
             self.assertFalse(has_tool_markup(text))
