@@ -45,8 +45,12 @@ def validate_source(value):
     path = Path(value).resolve(strict=True)
     if excluded(path):
         raise ValueError('此位置属于密钥、凭据或默认忽略目录，请选择资料文件。')
+    if path.is_file() and path.suffix.lower() == '.wlkb':
+        from knowledge_packages import inspect_package
+        inspect_package(path)
+        return str(path)
     if not path.is_dir() and (not path.is_file() or path.suffix.lower() not in SUPPORTED):
-        raise ValueError('支持文本、代码、PDF 和 DOCX；暂不支持此文件格式。')
+        raise ValueError('支持文本、代码、PDF、DOCX 和 .wlkb 知识包；暂不支持此文件格式。')
     return str(path)
 
 
@@ -107,6 +111,8 @@ class ReferenceTools:
             for i, value in enumerate(settings.get('paths', [])[:32]):
                 try:
                     path = Path(validate_source(value))
+                    if path.suffix.lower() == '.wlkb':
+                        continue  # Knowledge packages have their own local retrieval adapter.
                     self.roots[f'r{i+1}'] = path
                 except (OSError, ValueError):
                     continue

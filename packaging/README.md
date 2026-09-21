@@ -1,5 +1,7 @@
 # Windows 发布
 
+知识包接入：构建脚本会准备固定版本 BGE ONNX 模型。`wenlu.spec` 仅收集 `knowledge_embedding.FILES` 列出的三个通用模型文件，不收集 `.wlkb`、客户资料或 demo。程序自检会实际执行一次向量推理；无需访问知识库生成工具目录。源码环境可先运行 `prepare_knowledge_model.py`，直接调用 PyInstaller 前需先运行 `packaging/bundle_knowledge_model.py`。
+
 1. 使用 Python 3.12 创建 `.venv`，安装 `requirements-build.txt`，安装 Inno Setup 6。
 2. 修改 `version.py` 的版本号，执行 `packaging/build.ps1`。脚本执行测试、打包、独立程序自检并生成 `release/Wenlu-Setup-版本号.exe`。
 3. 使用 `python packaging/sign_release.py release/Wenlu-Setup-版本号.exe --key 私钥路径` 生成 `update.json` 和 `update.sig`。

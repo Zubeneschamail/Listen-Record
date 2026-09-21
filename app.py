@@ -1086,6 +1086,7 @@ class App:
         self.status.set("正在处理剩余音频…")
 
     def clear(self, preserve_recording=False):
+        self.knowledge_history_start = self.knowledge_rows_start = 0
         self.cancel_question_edit()
         self.context_meter.set_usage()
         self.composer.clear()
@@ -1192,14 +1193,27 @@ class App:
         self.toggle_auto_qa()
         return 'break'
 
+    def reset_knowledge_context(self):
+        """Keep visible history/recordings, but start a fresh context for the new customer."""
+        self.qa.reset()
+        self.knowledge_history_start = len(self.qa_history)
+        self.knowledge_rows_start = len(self.rows)
+        self.clipboard_pending.clear()
+        self.clipboard_request_generation = None
+        self.qa_pending_image_context = None
+        self.context_meter.set_usage()
+        self.qa_status.set('知识包已变更，后续问答使用新的资料上下文。')
+
     def session_context_snapshot(self):
         # Snapshot on the UI thread; compression runs on the request worker.
-        rows = ([(row.get('source', 'system'), row['text']) for row in self.rows]
+        rows = ([(row.get('source', 'system'), row['text']) for row in self.rows[getattr(self, 'knowledge_rows_start', 0):]]
                 if self.auto_qa.get() else [('所选上下文', text) for text in self.qa.context])
         if self.qa.source == 'clipboard':
             rows = []
         exchanges = []
         for index, (question, answer) in enumerate(self.qa_history):
+            if index < getattr(self, 'knowledge_history_start', 0):
+                continue
             if not answer:
                 continue  # A question being revised is not a completed exchange.
             description = self.qa_image_contexts.get(index)
@@ -1214,7 +1228,7 @@ class App:
             self.open_qa()
             self.qa.clear_auto()
             # Old transcript provides context only, never a new request.
-            self.qa.context.extend(row['text'][-1200:] for row in self.rows[-8:])
+            self.qa.context.extend(row['text'][-1200:] for row in self.rows[getattr(self, 'knowledge_rows_start', 0):][-8:])
             self.clipboard_pending.clear()
             self.clipboard_watcher.start()
             self.clipboard_status.set('监听中 · 等待新复制的文字或图片')

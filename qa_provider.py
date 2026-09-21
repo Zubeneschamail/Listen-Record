@@ -130,6 +130,8 @@ class APIProvider:
         self.workspace_loader = workspace_loader
         from reference_files import ReferenceCache
         self.reference_cache = ReferenceCache()
+        self.knowledge_library = None
+        self.knowledge_paths = ()
 
     def preflight(self):
         try:
@@ -209,7 +211,14 @@ class APIProvider:
         from reference_files import ReferenceTools, TOOLS
         from reference_policy import (requires_reference_tools, promises_reference_read,
                                       has_tool_markup, visible_partial, clean_tool_history, reference_partial)
-        references = ReferenceTools(self.workspace_loader(), cancel, cache=self.reference_cache) if (
+        settings = self.workspace_loader() if use_references and self.workspace_loader else {}
+        from knowledge_packages import KnowledgeLibrary, package_paths, INSTRUCTIONS as KNOWLEDGE_INSTRUCTIONS
+        knowledge_paths = tuple(package_paths(settings))
+        if self.knowledge_paths != knowledge_paths:
+            self.knowledge_paths = knowledge_paths
+            self.knowledge_library = KnowledgeLibrary() if knowledge_paths else None
+        knowledge_library = self.knowledge_library if knowledge_paths else None
+        references = ReferenceTools(settings, cancel, cache=self.reference_cache) if (
             use_references and self.provider == 'deepseek' and self.workspace_loader) else None
         if references and not references.roots:
             references = None
@@ -219,6 +228,17 @@ class APIProvider:
         tool_definitions = (TOOLS if references else []) + (WEB_TOOLS if web else [])
 
         async def request():
+            knowledge_context = ''
+            if knowledge_library:
+                if partial:
+                    partial('正在检索知识包…')
+                try:
+                    knowledge_context = await asyncio.to_thread(
+                        knowledge_library.context, settings, prompt, history, cancel)
+                except (OSError, ValueError) as exc:
+                    raise RuntimeError('知识包检索失败：' + str(exc)) from exc
+                if cancel.is_set():
+                    raise RuntimeError('已取消')
             system, separator, user = prompt.partition('\n')
             if web:
                 from datetime import datetime
@@ -240,9 +260,11 @@ class APIProvider:
                     '无法读取时解释实际原因；回答结束后不会有后台任务替你继续读取。'
                     '调用工具必须使用 API 提供的结构化 tool_calls 字段，不要在正文中输出工具调用协议标记。'
                     '可用资料根目录：'+json.dumps(references.description(), ensure_ascii=False))
+            if knowledge_context:
+                system += KNOWLEDGE_INSTRUCTIONS
             messages = ([{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
                         if separator else [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]
-                        if tool_definitions else [{'role': 'user', 'content': prompt}])
+                        if tool_definitions or knowledge_context else [{'role': 'user', 'content': prompt}])
             if image is not None:
                 messages[-1]['content'] = [
                     {'type': 'text', 'text': messages[-1]['content']},
@@ -250,7 +272,14 @@ class APIProvider:
                         'url': 'data:image/png;base64,' + base64.b64encode(image).decode('ascii')}}]
             if history:
                 messages[-1:-1] = clean_tool_history(history)
-            require_tool = references is not None and requires_reference_tools(prompt, history)
+            if knowledge_context:
+                # Reference data has user-message priority, not system-instruction priority.
+                attachment = '\n[本轮知识包检索资料]\n' + knowledge_context
+                if isinstance(messages[-1]['content'], list):
+                    messages[-1]['content'].append({'type': 'text', 'text': attachment})
+                else:
+                    messages[-1]['content'] += attachment
+            require_tool = references is not None and not knowledge_context and requires_reference_tools(prompt, history)
             require_web = intent if web and intent in WEB_NAMES else None
             require_tool = require_tool or bool(require_web)
             corrections = 0

@@ -55,6 +55,9 @@ class SettingsSession:
             app.qa.reset()
             app.qa_selection = None
             app.qa_status.set('')
+            from knowledge_packages import context_changed
+            if context_changed(self.references, app.reference_controls['snapshot']()):
+                app.reset_knowledge_context()
         if app.auto_qa.get() != app.settings_auto_qa.get():
             app.auto_qa.set(app.settings_auto_qa.get())
             app.toggle_auto_qa()

@@ -28,8 +28,25 @@ if __name__ == '__main__':
             if echo_audio.shape != (160,) or not np.isfinite(echo_audio).all():
                 raise RuntimeError('Packaged echo cancellation self-test failed')
             root.destroy()
+            knowledge_package_sources = []
+            if '--verify-knowledge-package' in sys.argv:
+                import threading
+                from knowledge_packages import KnowledgeLibrary
+                package_path = sys.argv[sys.argv.index('--verify-knowledge-package') + 1]
+                package_result = json.loads(KnowledgeLibrary().context(
+                    {'enabled': True, 'paths': [package_path]},
+                    '数据库已更新，但通知没有发出去怎么办？', [], threading.Event()))
+                knowledge_package_sources = [item['章节'] for item in package_result['片段']]
+                if not knowledge_package_sources:
+                    raise RuntimeError('Packaged knowledge retrieval returned no sources')
             if '--verify-bundled-model' in sys.argv:
                 from model_download import cached_model, BUNDLED_MODELS
+                from knowledge_embedding import Encoder, BUNDLED_MODEL_DIR
+                knowledge_encoder = Encoder(BUNDLED_MODEL_DIR)
+                knowledge_vector = knowledge_encoder.encode(['知识包检索验证'], query=True)
+                if knowledge_vector.shape != (1, 512) or not np.isfinite(knowledge_vector).all():
+                    raise RuntimeError('Bundled knowledge model failed')
+                del knowledge_encoder
                 from model_runtime import load_model
                 if cached_model('small') != BUNDLED_MODELS / 'small':
                     raise RuntimeError('Bundled model missing; refusing cache fallback')
@@ -76,6 +93,8 @@ if __name__ == '__main__':
                 del model
                 gpu_verified = True
             report.write_text(json.dumps({'ok': True, 'version': app.VERSION, 'echo_verified': True,
+                                         'knowledge_model_verified': '--verify-bundled-model' in sys.argv,
+                                         'knowledge_package_sources': knowledge_package_sources,
                                          'gpu_verified': gpu_verified,
                                          'bundled_model': 'small' if '--verify-bundled-model' in sys.argv else None}), encoding='utf-8')
         except Exception:

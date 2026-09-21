@@ -10,6 +10,8 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 ".venv\Scripts\python.exe" prepare_model.py
 if errorlevel 1 goto failed
+".venv\Scripts\python.exe" prepare_knowledge_model.py
+if errorlevel 1 goto failed
 echo Ready. Open start.cmd to launch.
 pause
 exit /b 0

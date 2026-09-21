@@ -179,23 +179,29 @@ def build(app, parent):
 
     def refresh():
         listing.delete(0, 'end')
+        package_index = 0
         for index, value in enumerate(settings['paths']):
             path = Path(value)
-            prefix = '目录' if path.is_dir() else '文件'
+            prefix = '知识包' if path.suffix.lower() == '.wlkb' else '目录' if path.is_dir() else '文件'
+            if path.suffix.lower() == '.wlkb':
+                package_index += 1
+            label = f'kb{package_index}' if path.suffix.lower() == '.wlkb' else f'r{index+1}'
             missing = ' · 不可用' if not path.exists() else ''
-            listing.insert('end', f'  r{index+1} · {prefix}  {path.name}{missing}')
+            listing.insert('end', f'  {label} · {prefix}  {path.name}{missing}')
         count.set(f"{len(settings['paths'])} 项资料")
         if hasattr(app, 'reference_path_label'):
             app.reference_path_label.set_paths(settings['paths'])
         provider_changed()
 
     def provider_changed(*_):
-        notice.set('DeepSeek 会按需搜索和读取，并在回答中标注文件来源。'
+        notice.set('知识包会先在本机检索；普通文件由 DeepSeek 按需查阅。'
                    if app.qa_settings['provider'] == 'deepseek' else
-                   '仅 DeepSeek 支持查阅资料，请在「答疑」中配置模型服务。')
+                   '兼容 API 支持知识包检索；普通文件查阅仍需 DeepSeek。')
 
     def commit(paths):
         updated = {'enabled': enabled.get(), 'paths': paths}
+        from knowledge_packages import context_changed
+        changed_knowledge = context_changed(settings, updated)
         try:
             if not app.settings_visible:
                 save_settings(updated)
@@ -208,6 +214,8 @@ def build(app, parent):
             app.qa.reset()
             app.qa_selection = None
             app.qa_status.set('')
+            if changed_knowledge:
+                app.reset_knowledge_context()
         refresh()
 
     def snapshot():
@@ -230,6 +238,9 @@ def build(app, parent):
                 if value.casefold() not in {p.casefold() for p in paths}:
                     if len(paths) >= 32:
                         raise ValueError('最多添加 32 项资料；可用文件夹统一管理。')
+                    if Path(value).suffix.lower() == '.wlkb':
+                        from knowledge_packages import validate_selection
+                        validate_selection(paths + [value])
                     paths.append(value)
             except (OSError, ValueError) as exc:
                 errors.append(f'{Path(value).name}：{str(exc) if isinstance(exc, ValueError) else "路径不可访问"}')
@@ -241,7 +252,11 @@ def build(app, parent):
 
     def add_files():
         add(filedialog.askopenfilenames(parent=dialog_parent(), title='添加参考文件',
-            filetypes=[('文档与文本', '*.txt *.md *.pdf *.docx *.csv *.json'), ('所有文件', '*.*')]))
+            filetypes=[('文档与知识包', '*.txt *.md *.pdf *.docx *.csv *.json *.wlkb'), ('所有文件', '*.*')]))
+
+    def add_packages():
+        add(filedialog.askopenfilenames(parent=dialog_parent(), title='添加闻录知识包',
+            filetypes=[('闻录知识包', '*.wlkb')]))
 
     def add_folder():
         folder = filedialog.askdirectory(parent=dialog_parent(), title='添加参考文件夹')
@@ -266,15 +281,16 @@ def build(app, parent):
 
     ui.button(actions, '添加文件', add_files, primary=True).pack(side='left')
     ui.button(actions, '添加文件夹', add_folder).pack(side='left', padx=8)
+    ui.button(actions, '知识包', add_packages).pack(side='left')
     ui.button(actions, '移除', remove).pack(side='right')
     listing.bind('<<ListboxSelect>>', selection)
     ui.note(parent, variable=notice).pack(fill='x', pady=(16, 6))
-    ui.note(parent, '支持文本、代码、PDF、DOCX；相关片段会发送给模型。\n'
-            '扫描版 PDF 需先识别为文字。').pack(fill='x')
+    ui.note(parent, '支持 .wlkb、文本、代码、PDF、DOCX；相关片段会发送给模型。\n'
+            '同一时间仅添加同一客户的知识包，最多 4 个。').pack(fill='x')
     app.qa_provider_name.trace_add('write', provider_changed)
     # Named controls support UI verification without touching personal files.
     app.reference_controls = dict(listing=listing, enabled=enabled, add=add, remove=remove,
-                                  add_files=add_files, add_folder=add_folder,
+                                  add_files=add_files, add_folder=add_folder, add_packages=add_packages,
                                   paths=lambda: list(settings['paths']), remove_path=remove_path,
                                   snapshot=snapshot, restore=restore, persist=lambda: save_settings(snapshot()))
     refresh()
@@ -292,3 +308,4 @@ def build_add_button(app, parent):
     menu = app.reference_add_menu = PopupMenu(app.root)
     menu.add_command(label='文件', command=app.reference_controls['add_files'])
     menu.add_command(label='文件夹', command=app.reference_controls['add_folder'])
+    menu.add_command(label='知识包', command=app.reference_controls['add_packages'])

@@ -15,3 +15,6 @@ dist/
 release/
 .build-tools/
 *.pem
+
+# Local knowledge-base demo materials; not part of release inputs.
+/artifacts/knowledge-demo/

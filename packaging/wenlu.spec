@@ -7,6 +7,14 @@ bundled = root / 'build/bundled-models/small'
 if not (bundled / 'model.bin').is_file():
     raise RuntimeError('Run packaging/bundle_model.py before building the offline installer')
 assets.append((str(bundled), 'bundled-models/small'))
+from knowledge_embedding import FILES as KNOWLEDGE_MODEL_FILES, sha256
+knowledge_model = root / 'build/bundled-knowledge-model'
+# Explicit public-model allowlist: never collect .wlkb, customer files or demos.
+for name, expected in KNOWLEDGE_MODEL_FILES.items():
+    source = knowledge_model / name
+    if not source.is_file() or sha256(source) != expected:
+        raise RuntimeError('Run packaging/bundle_knowledge_model.py before building')
+    assets.append((str(source), str(Path('bundled-knowledge-model') / Path(name).parent)))
 for package in ['faster_whisper', 'opencc', 'certifi']:
     assets += collect_data_files(package)
 for package in ['faster-whisper', 'huggingface-hub', 'tokenizers', 'tqdm', 'pywebrtc-audio', 'mistune']:

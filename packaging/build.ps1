@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
 & .\.venv\Scripts\python.exe packaging/bundle_model.py
 if ($LASTEXITCODE -ne 0) { throw 'Bundled model preparation failed' }
+& .\.venv\Scripts\python.exe packaging/bundle_knowledge_model.py
+if ($LASTEXITCODE -ne 0) { throw 'Knowledge model preparation failed' }
 & .\.venv\Scripts\python.exe -m unittest discover -s tests -q
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
 & .\.venv\Scripts\python.exe -m PyInstaller packaging/wenlu.spec --noconfirm
