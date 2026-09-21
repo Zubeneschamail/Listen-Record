@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from app import App
+from app import App, NO_AUDIO_DEVICE
 from qa_settings_dialog import show
 
 
@@ -86,6 +86,113 @@ class SettingsInteractionTests(unittest.TestCase):
             start.assert_not_called()
             app.toggle_settings()
             self.assertEqual(app.hotwords.get(), original[0])
+
+    def test_echo_switch_is_saved_explicitly_and_cancel_restores_it(self):
+        app = self.app
+        original = app.echo_cancellation.get()
+        app.echo_cancellation.set(not original)
+        app.hide_settings()
+        self.assertEqual(app.echo_cancellation.get(), original)
+        app.toggle_settings()
+        with patch('app.save_desktop') as save, patch('app.save_preferences'), \
+                patch('reference_settings.save_settings'), patch.object(app.engine, 'start') as start:
+            app.echo_checkbox.invoke()
+            save.assert_not_called()
+            app.settings_save_button.invoke()
+            self.assertEqual(save.call_args.args[0]['echo_cancellation'], not original)
+            start.assert_not_called()
+        app.toggle_settings()
+        self.assertEqual(app.echo_cancellation.get(), not original)
+
+    def test_unselected_audio_devices_save_cancel_and_reload(self):
+        app = self.app
+        original = (app.device.get(), app.microphone.get())
+        for widget in (app.device, app.microphone):
+            self.assertIn(NO_AUDIO_DEVICE, widget['values'])
+            widget.set(NO_AUDIO_DEVICE)
+        app.hide_settings()
+        self.assertEqual((app.device.get(), app.microphone.get()), original)
+        app.toggle_settings()
+        app.device.set(NO_AUDIO_DEVICE)
+        app.microphone.set(NO_AUDIO_DEVICE)
+        with patch('app.save_desktop') as save, patch('app.save_preferences'), \
+                patch('reference_settings.save_settings'):
+            app.settings_save_button.invoke()
+            saved = save.call_args.args[0]
+        self.assertEqual((saved['output'], saved['input']), (NO_AUDIO_DEVICE, NO_AUDIO_DEVICE))
+        app.device.set('')
+        app.microphone.set('')
+        with patch('app.preferences', return_value=saved):
+            app.load_desktop_settings()
+        self.assertEqual((app.device.get(), app.microphone.get()), (NO_AUDIO_DEVICE, NO_AUDIO_DEVICE))
+
+    def test_refresh_preserves_none_and_tracks_real_device_after_reordering(self):
+        app = self.app
+        app.devices = []
+        app.input_devices = []
+        app.device.set('')
+        app.microphone.set('')
+        outputs = [{'name': '扬声器 A', 'index': 10}, {'name': '扬声器 B', 'index': 11}]
+        inputs = [{'name': '麦克风 A', 'index': 20, 'hostApi': 0, 'maxInputChannels': 1}]
+        with patch('app.pa.PyAudio') as factory:
+            audio = factory.return_value.__enter__.return_value
+            audio.get_loopback_device_info_generator.side_effect = lambda: iter(outputs)
+            audio.get_host_api_info_by_type.return_value = {'index': 0, 'defaultInputDevice': 20}
+            audio.get_default_wasapi_loopback.return_value = {'index': 11}
+            audio.get_device_count.side_effect = lambda: len(inputs)
+            audio.get_device_info_by_index.side_effect = lambda i: inputs[i]
+            app.refresh()
+            self.assertEqual((app.device.get(), app.microphone.get()), ('扬声器 B', '麦克风 A'))
+            app.microphone.set(NO_AUDIO_DEVICE)
+            outputs.reverse()
+            app.refresh()
+            self.assertEqual((app.device.get(), app.microphone.get()), ('扬声器 B', NO_AUDIO_DEVICE))
+            app.device.set(NO_AUDIO_DEVICE)
+            app.refresh()
+            self.assertEqual((app.device.get(), app.microphone.get()), (NO_AUDIO_DEVICE, NO_AUDIO_DEVICE))
+            outputs.clear()
+            inputs.clear()
+            app.refresh()
+            self.assertEqual(tuple(app.device['values']), (NO_AUDIO_DEVICE,))
+            self.assertEqual(tuple(app.microphone['values']), (NO_AUDIO_DEVICE,))
+
+    def test_recording_skips_unselected_sources_and_rejects_empty_capture(self):
+        app = self.app
+        app.hide_settings()
+        app.devices = [{'index': 10}]
+        app.input_devices = [{'index': 20}]
+        app.device.configure(values=['扬声器', NO_AUDIO_DEVICE])
+        app.microphone.configure(values=['麦克风', NO_AUDIO_DEVICE])
+        with tempfile.TemporaryDirectory() as folder, patch('app.RECORDINGS', Path(folder)), \
+                patch('app.save_preferences'), patch.object(app.engine, 'start') as start, \
+                patch.object(app, 'toggle_settings') as settings, patch('app.messagebox.showinfo') as info:
+            for mode, output, microphone, expected in (
+                    ('系统声音 + 麦克风', 0, 1, [{'index': 10, 'source': 'system'}]),
+                    ('系统声音 + 麦克风', 1, 0, [{'index': 20, 'source': 'microphone'}]),
+                    ('系统声音 + 麦克风', 0, 0, [{'index': 10, 'source': 'system'}, {'index': 20, 'source': 'microphone'}]),
+                    ('系统声音 + 麦克风', 1, 1, []),
+                    ('仅系统声音', 1, 0, []),
+                    ('仅麦克风', 0, 1, [])):
+                with self.subTest(mode=mode, output=output, microphone=microphone):
+                    app.set_busy(False)
+                    app.capture_mode.set(mode)
+                    app.device.current(output)
+                    app.microphone.current(microphone)
+                    start.reset_mock()
+                    settings.reset_mock()
+                    info.reset_mock()
+                    files_before = list(Path(folder).iterdir())
+                    app.start()
+                    if expected:
+                        self.assertEqual(start.call_args.args[0], expected)
+                        info.assert_not_called()
+                    else:
+                        start.assert_not_called()
+                        settings.assert_called_once()
+                        info.assert_called_once()
+                        self.assertFalse(app.busy)
+                        self.assertEqual(list(Path(folder).iterdir()), files_before)
+            app.set_busy(False)
 
     def test_save_commits_settings_and_only_then_enables_automatic_requests(self):
         app = self.app
@@ -206,6 +313,25 @@ class SettingsInteractionTests(unittest.TestCase):
                 self.root.update()
                 self.assertEqual(combo.get(), original)
         self.assertIs(self.root.grab_current(), window)
+
+    def test_balance_display_clears_on_failure_and_ignores_previous_account(self):
+        from decimal import Decimal
+        from qa_balance import Balance
+        app = self.app
+        app.qa_settings = {'provider': 'deepseek', 'profiles': {}}
+        app.configure_qa_provider()
+        revision = app.balance_query.revision
+        app.handle_qa_balance((revision, Balance(True, {'CNY': Decimal('25')}), ''))
+        self.assertEqual(app.balance_status.get(), '¥25.00')
+        self.assertRegex(app.balance_detail.get(), r'^更新于 \d{2}:\d{2}:\d{2}$')
+        self.assertFalse(hasattr(app, 'balance_progress'))
+        app.handle_qa_balance((revision, None, '网络不可用'))
+        self.assertEqual(app.balance_status.get(), '查询失败')
+        app.qa_settings['provider'] = 'compatible'
+        app.configure_qa_provider()
+        app.handle_qa_balance((revision, Balance(True, {'CNY': Decimal('99')}), ''))
+        self.assertEqual(app.balance_status.get(), '暂不支持')
+        self.assertEqual(str(app.balance_check_button.cget('state')), 'disabled')
 
     def test_detection_dots_follow_results_and_theme_changes(self):
         indicator = self.app.connection_status_indicator

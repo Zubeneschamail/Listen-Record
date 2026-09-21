@@ -11,14 +11,15 @@ ICONS = Path(__file__).resolve().parent / 'assets' / 'icons'
 class IconButton(tk.Button):
     def __init__(self, parent, icon, **kwargs):
         self.icon_name = icon
+        names = (icon, 'check', 'restore') if icon == 'maximize' else (icon, 'check')
         self.images = {name: tk.PhotoImage(master=parent, file=str(ICONS / f'{name}.png'))
-                       for name in (icon, 'check')}
+                       for name in names}
         original = Image.open(ICONS / f'{icon}.png').convert('RGBA')
         self.neutral_images = {}
-        if icon in ('settings', 'copy', 'close', 'minimize', 'more', 'add', 'collapse'):
+        if icon in ('settings', 'copy', 'close', 'minimize', 'maximize', 'more', 'add', 'collapse'):
             for tone in ('#737b8c', '#AEBBCD'):
                 variants = {}
-                for name in (icon, 'check'):
+                for name in names:
                     source = Image.open(ICONS / f'{name}.png').convert('RGBA')
                     tinted = Image.new('RGBA', source.size, tone)
                     tinted.putalpha(source.getchannel('A'))
@@ -59,6 +60,7 @@ class IconButton(tk.Button):
             self.images.update(self.neutral_images.get(tone, self.neutral_images['#737b8c']))
         if any(key in kwargs for key in ('text', 'state', 'fg', 'foreground')):
             name = ('active' if self.icon_name in ('microphone', 'waveform') and self.cget('text') == '停止转写'
+                    else 'restore' if self.icon_name == 'maximize' and self.cget('text') == '恢复'
                     else 'check' if self.cget('text') == '已复制' else self.icon_name)
             finishing = self.icon_name == 'waveform' and self.cget('text') == '收尾中…'
             image = (self.disabled_image if str(self.cget('state')) == 'disabled' and not finishing else

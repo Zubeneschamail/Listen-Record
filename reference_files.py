@@ -1,10 +1,12 @@
 """User-selected, read-only reference files exposed through bounded tools."""
 import fnmatch
+from collections import OrderedDict
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import time
+import threading
 import zipfile
 from xml.etree import ElementTree
 
@@ -66,8 +68,39 @@ TOOLS = [
 ]
 
 
+class ReferenceCache:
+    """Bounded in-memory parsed text shared across requests to one provider."""
+    def __init__(self, max_bytes=16_000_000, max_files=128):
+        self.max_bytes, self.max_files = max_bytes, max_files
+        self.entries = OrderedDict()
+        self.size = 0
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            value = self.entries.get(key)
+            if value is not None:
+                self.entries.move_to_end(key)
+                return value[0]
+        return None
+
+    def put(self, key, lines):
+        cost = sum(len(line)*4 + 64 for line in lines)
+        with self.lock:
+            # Retain only the newest parsed version of a path.
+            for old in list(self.entries):
+                if old[0] == key[0]:
+                    self.size -= self.entries.pop(old)[1]
+            if cost > self.max_bytes:
+                return
+            self.entries[key] = (lines, cost)
+            self.size += cost
+            while self.size > self.max_bytes or len(self.entries) > self.max_files:
+                self.size -= self.entries.popitem(last=False)[1][1]
+
+
 class ReferenceTools:
-    def __init__(self, settings, cancel):
+    def __init__(self, settings, cancel, cache=None):
         self.cancel = cancel
         self.roots = {}
         if settings.get('enabled'):
@@ -78,7 +111,7 @@ class ReferenceTools:
                 except (OSError, ValueError):
                     continue
         self.remaining = 32000  # Serialized tool-result bytes across the request.
-        self.cache = {}
+        self.cache = cache if cache is not None else ReferenceCache()
         self.deadline = 0
         self.truncated = False
 
@@ -152,9 +185,10 @@ class ReferenceTools:
     def lines(self, path):
         self.check()
         stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
-        if key in self.cache:
-            return self.cache[key]
+        key = (str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_dev, stat.st_ino)
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
         suffix = path.suffix.lower()
         if suffix not in SUPPORTED:
             raise ValueError('不支持读取此文件格式。')
@@ -198,9 +232,9 @@ class ReferenceTools:
         if len(text) > 500000:
             raise ValueError('文件文字过多，请拆分后添加。')
         lines = text.splitlines()
-        if len(self.cache) >= 8:
-            self.cache.pop(next(iter(self.cache)))
-        self.cache[key] = lines
+        after = path.stat()
+        if key[1:] == (after.st_mtime_ns, after.st_ctime_ns, after.st_size, after.st_dev, after.st_ino):
+            self.cache.put(key, lines)
         return lines
 
     def dispatch(self, name, args):
@@ -209,7 +243,13 @@ class ReferenceTools:
             offset = args.get('offset', 0)
             if not isinstance(pattern, str) or len(pattern) > 200 or type(offset) is not int or not 0 <= offset <= 10000:
                 raise ValueError('文件筛选参数无效。')
-            files = [v for v, _ in self.files() if fnmatch.fnmatch(v.lower(), pattern.lower()) or fnmatch.fnmatch(PurePosixPath(v).name.lower(), pattern.lower())]
+            files = []
+            for virtual, _ in self.files():
+                if fnmatch.fnmatch(virtual.lower(), pattern.lower()) or fnmatch.fnmatch(PurePosixPath(virtual).name.lower(), pattern.lower()):
+                    files.append(virtual)
+                    # One lookahead is enough to know whether another page exists.
+                    if len(files) > offset + 60:
+                        break
             return {'files': files[offset:offset+60], 'next_offset': offset+60 if len(files)>offset+60 else None, 'scan_limited': self.truncated}
         if name == 'read_reference_file':
             path = self.resolve(args.get('path'))
@@ -231,6 +271,7 @@ class ReferenceTools:
             if scope:
                 self.resolve(scope)
             results, skipped, scanned = [], 0, 0
+            folded_query = query.casefold()
             for virtual, path in self.files(scope):
                 self.check()
                 scanned += 1
@@ -244,7 +285,7 @@ class ReferenceTools:
                     continue
                 for i, line in enumerate(lines):
                     self.check()
-                    offset = line.casefold().find(query.casefold())
+                    offset = line.casefold().find(folded_query)
                     if offset >= 0:
                         results.append({'path': virtual, 'line': i+1, 'text': line[max(0, offset-100):offset+220]})
                         if len(results) >= 20:

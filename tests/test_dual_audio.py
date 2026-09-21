@@ -9,6 +9,12 @@ from app import Transcriber
 
 class DualAudioTests(unittest.TestCase):
     def test_both_inputs_are_tagged_and_cleanup_waits_for_both(self):
+        self.verify_dual_capture(False)
+
+    def test_aec_keeps_system_path_and_drains_processed_mic_on_stop(self):
+        self.verify_dual_capture(True)
+
+    def verify_dual_capture(self, echo_enabled):
         events = queue.Queue()
         engine = Transcriber(events)
         engine.model_name, engine.model = 'small', object()
@@ -50,9 +56,16 @@ class DualAudioTests(unittest.TestCase):
             return [(chunk.start, chunk.start+.1, '我说话' if chunk.audio[0] > .15 else '电脑播放', chunk.epoch)]
 
         api = API()
+        from unittest.mock import Mock
+        processor = Mock()
+        processor.process.side_effect = lambda near, far: near.copy()
         with patch('app.pa.PyAudio', return_value=api), patch('app.PauseSegmenter', Segmenter), \
-             patch('app.decode_chunk', side_effect=decode), patch('app.DraftPreview'):
-            engine.run([{'index': 1, 'source': 'system'}, {'index': 2, 'source': 'microphone'}], 'small', 'zh')
+             patch('app.decode_chunk', side_effect=decode), patch('app.DraftPreview'), \
+             patch('echo_cancellation.make_processor', return_value=processor) as factory:
+            engine.run([{'index': 1, 'source': 'system'}, {'index': 2, 'source': 'microphone'}],
+                       'small', 'zh', echo_cancellation=echo_enabled)
+        self.assertEqual(factory.call_count, int(echo_enabled))
+        self.assertEqual(processor.process.call_count, int(echo_enabled))
         messages = list(events.queue)
         self.assertFalse([v for k,v in messages if k == 'error'])
         rows = [v for k,v in messages if k == 'segment']

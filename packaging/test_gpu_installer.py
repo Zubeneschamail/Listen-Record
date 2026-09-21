@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     wheels = ROOT / 'build/gpu-wheels'
     names = ['nvidia_cublas_cu12-12.4.5.8-py3-none-win_amd64.whl',
-             'nvidia_cudnn_cu12-9.1.0.70-py3-none-win_amd64.whl']
+             'nvidia_cudnn_cu12-9.1.0.70-py3-none-win_amd64.whl',
+             'nvidia_cuda_nvrtc_cu12-12.4.127-py3-none-win_amd64.whl']
     assert all((wheels / name).is_file() for name in names)
     requests = []
 
@@ -64,7 +65,7 @@ Name: "gpu"; Description: "GPU"
     base = f'http://127.0.0.1:{server.server_port}/'
     try:
         subprocess.run([str(compiler), '/Q', '/DGpuCublasUrl=' + base + names[0],
-                        '/DGpuCudnnUrl=' + base + names[1], str(script)], check=True)
+                        '/DGpuCudnnUrl=' + base + names[1], '/DGpuNvrtcUrl=' + base + names[2], str(script)], check=True)
         for mode in ('cpu', 'gpu', 'corrupt'):
             requests.clear()
             Handler.corrupt = mode == 'corrupt'
@@ -80,6 +81,8 @@ Name: "gpu"; Description: "GPU"
                 assert all('/' + name in requests for name in names), requests
                 assert (target / '_internal/gpu-runtime/nvidia/cublas/bin/cublas64_12.dll').is_file()
                 assert (target / '_internal/gpu-runtime/nvidia/cudnn/bin/cudnn64_9.dll').is_file()
+                assert (target / '_internal/gpu-runtime/nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll').is_file()
+                assert (target / '_internal/gpu-runtime/nvidia/cuda_nvrtc/bin/nvrtc-builtins64_124.dll').is_file()
                 assert list(target.rglob('License.txt')) or list(target.rglob('LICENSE*'))
             else:
                 assert result.returncode != 0 and requests

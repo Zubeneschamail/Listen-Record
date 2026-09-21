@@ -168,6 +168,31 @@ class StartupUITests(unittest.TestCase):
             self.assertEqual(self.app.qa_settings['provider'], 'compatible')
             self.assertEqual(self.app.startup_pending_issues, [])
 
+    def test_loading_surface_and_children_drag_without_interrupting_checks(self):
+        fake = self.start_with({key:('checking','等待') for key in ('model','gpu','deepseek')})
+        self.root.geometry('560x380+100+100')
+        self.root.update()
+        overlay = self.app.startup_overlay
+        surfaces = [overlay]
+        for widget in surfaces:
+            surfaces.extend(child for child in widget.winfo_children() if not isinstance(child, tk.Button))
+        for widget in surfaces:
+            with self.subTest(widget=widget.winfo_class()):
+                self.root.geometry('560x380+100+100')
+                self.root.update()
+                widget.event_generate('<ButtonPress-1>', x=5, y=5, rootx=150, rooty=150)
+                widget.event_generate('<B1-Motion>', x=25, y=20, rootx=170, rooty=165)
+                widget.event_generate('<ButtonRelease-1>', x=25, y=20, rootx=170, rooty=165)
+                self.root.update()
+                self.assertEqual((self.root.winfo_rootx(), self.root.winfo_rooty()), (120, 115))
+                self.assertIsNone(self.app._drag_origin)
+                self.assertIs(self.root.grab_current(), overlay)
+                self.assertIsNotNone(overlay.timer)
+                self.assertTrue(fake.active)
+        close = next(child for child in overlay.winfo_children() if isinstance(child, tk.Button))
+        self.assertFalse(close.bind('<ButtonPress-1>'))
+        self.assertFalse(close.bind('<B1-Motion>'))
+
     def test_deepseek_only_failure_automatically_opens_its_configuration(self):
         fake = self.start_with({'model':('success','OK'),'gpu':('success','OK'),'deepseek':('error','API Key 无效')})
         fake.active = False

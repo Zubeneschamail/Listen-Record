@@ -37,8 +37,22 @@ class StartupOverlay(tk.Frame):
                                font=(typography.UI_FAMILY, 9), wraplength=350, justify='center')
         self.detail.pack(fill='x', pady=(12, 0))
         card.bind('<Configure>', lambda e: self.detail.configure(wraplength=max(160, e.width-8)))
+        # Child labels/canvases do not bubble pointer events to their parent.
+        # Bind the whole loading surface, leaving the close button interactive.
+        def bind_drag(widget):
+            if isinstance(widget, tk.Button):
+                return
+            widget.bind('<ButtonPress-1>', app.drag_begin, add='+')
+            widget.bind('<B1-Motion>', app.drag_move, add='+')
+            widget.bind('<ButtonRelease-1>', self.end_drag, add='+')
+            for child in widget.winfo_children():
+                bind_drag(child)
+        bind_drag(self)
         self.angle, self.timer = 0, None
         self.animate()
+
+    def end_drag(self, event=None):
+        self.app._drag_origin = None
 
     def animate(self):
         self.angle = (self.angle - 20) % 360
@@ -54,6 +68,7 @@ class StartupOverlay(tk.Frame):
         self.detail.configure(text=(pending[0][:110] if pending else '检查完成'))
 
     def destroy(self):
+        self.end_drag()
         if self.timer:
             self.after_cancel(self.timer)
             self.timer = None

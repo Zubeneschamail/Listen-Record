@@ -1,67 +1,112 @@
 import tkinter as tk
 import unittest
-from types import SimpleNamespace
+from unittest.mock import patch
 
 from app import App
 
 
-class AnswerScrollTests(unittest.TestCase):
-    def test_history_position_and_bottom_follow(self):
-        root = tk.Tk()
-        root.geometry('360x240')
-        text = tk.Text(root, wrap='word')
-        text.pack(fill='both', expand=True)
-        app = SimpleNamespace(qa_text=text, qa_answer='', qa_question='问题',
-                              qa_display_history=[], answer_copy_button=tk.Button(root),
-                              qa_placeholder=tk.Label(text))
-        try:
-            root.update()
-            app.qa_answer = '\n'.join(f'历史内容 {i}' for i in range(200))
-            App.render_qa(app)
-            root.update()
-            self.assertAlmostEqual(text.yview()[1], 1.0)
+class QAScrollTests(unittest.TestCase):
+    def setUp(self):
+        for name in ('app.GlobalHotkey', 'app.App.start_tray', 'app.ClipboardWatcher',
+                     'qa_connection.QAConnection.check', 'app.save_desktop'):
+            target = patch(name)
+            target.start()
+            self.addCleanup(target.stop)
+        self.root = tk.Tk()
+        self.app = App(self.root)
+        self.root.geometry('640x420')
+        self.root.update()
+        self.app.qa_question = '长回答的滚动测试'
+        self.app.qa_answer = '\n\n'.join(f'第 {i} 段 **重点**。'+('原理与实现细节，方案取舍与边界。'*6) for i in range(45))
+        self.app.render_qa()
+        self.root.update()
 
-            # Several streamed chunks can arrive in one poll before Tk redraws;
-            # long wrapped paragraphs and spacing must not break bottom follow.
-            text.configure(spacing1=2, spacing2=5, spacing3=12, padx=16, pady=10)
-            root.update()
-            text.yview_moveto(1)
-            root.update()
-            self.assertAlmostEqual(text.yview()[1], 1.0)
-            for _ in range(5):
-                app.qa_answer += '连续生成的长段落需要自动换行并保持底部可见。' * 20
-                App.render_qa(app, streaming=True)
-            root.update()
-            self.assertAlmostEqual(text.yview()[1], 1.0)
+    def tearDown(self):
+        for timer in self.root.tk.call('after', 'info'):
+            self.root.after_cancel(timer)
+        self.app.close()
 
-            text.yview('40.0')
-            root.update()
-            anchor = text.index('@0,0')
-            app.qa_answer += '\n' + '\n'.join(f'新增 {i}' for i in range(50))
-            App.render_qa(app, streaming=True)
-            root.update()
-            self.assertEqual(text.index('@0,0'), anchor)
+    def test_scrolled_up_view_and_selection_stay_fixed_during_stream(self):
+        app, text = self.app, self.app.qa_text
+        text.yview_moveto(.35)
+        self.root.update()
+        top = text.index('@0,0')
+        y = text.dlineinfo(top)[1]
+        text.tag_add('sel', top, top+'+5c')
+        selected = text.get('sel.first', 'sel.last')
+        with patch.object(text, 'update_idletasks', side_effect=AssertionError('Forced intermediate paint')):
+            for i in range(12):
+                app.qa_answer += f' 新增片段 {i}。'
+                app.render_qa(streaming=True)
+                self.root.update()
+                self.assertEqual(text.index('@0,0'), top)
+                self.assertEqual(text.dlineinfo(top)[1], y)
+                self.assertEqual(text.get('sel.first', 'sel.last'), selected)
 
-            # Auto adds a new turn by rebuilding the transcript.
-            app.qa_display_history.append((app.qa_question, app.qa_answer))
-            app.qa_question, app.qa_answer = '新问题', '新回复\n' * 80
-            App.render_qa(app)
-            root.update()
-            self.assertEqual(text.index('@0,0'), anchor)
+    def test_bottom_follow_resumes_only_after_user_scrolls_back(self):
+        app, text = self.app, self.app.qa_text
+        text.yview_moveto(1)
+        self.root.update()
+        for i in range(8):
+            app.qa_answer += '\n\n' + f'新段落 {i} '+('流式回答继续。'*16)
+            app.render_qa(streaming=True)
+            self.root.update()
+            self.assertGreaterEqual(text.yview()[1], .999)
+        text.yview_moveto(.2)
+        self.root.update()
+        top = text.index('@0,0')
+        app.qa_answer += '\n\n继续生成。'
+        app.render_qa(streaming=True)
+        self.root.update()
+        self.assertEqual(text.index('@0,0'), top)
+        text.yview_moveto(1)
+        self.root.update()
+        app.qa_answer += '\n\n继续跟随。'*12
+        app.render_qa(streaming=True)
+        self.root.update()
+        self.assertGreaterEqual(text.yview()[1], .999)
 
-            text.see('end')
-            root.update()
-            app.qa_answer += '继续回答\n' * 40
-            App.render_qa(app, streaming=True)
-            root.update()
-            self.assertAlmostEqual(text.yview()[1], 1.0)
+    def test_burst_bottom_follow_and_new_turn_preserve_scroll_intent(self):
+        app, text = self.app, self.app.qa_text
+        text.yview_moveto(1)
+        self.root.update()
+        for _ in range(5):
+            app.qa_answer += '连续生成的长段落需要自动换行并保持底部可见。' * 20
+            app.render_qa(streaming=True)
+        self.root.update()
+        self.assertAlmostEqual(text.yview()[1], 1.0)
 
-            text.yview_scroll(-1, 'units')
-            root.update()
-            anchor = text.index('@0,0')
-            app.qa_answer += '末尾新内容\n' * 20
-            App.render_qa(app, streaming=True)
-            root.update()
-            self.assertEqual(text.index('@0,0'), anchor)
-        finally:
-            root.destroy()
+        text.yview_moveto(.35)
+        self.root.update()
+        anchor = text.index('@0,0')
+        app.qa_display_history.append((app.qa_question, app.qa_answer))
+        app.qa_question, app.qa_answer = '新问题', '新回复\n' * 80
+        app.render_qa()
+        self.root.update()
+        self.assertEqual(text.index('@0,0'), anchor)
+
+        text.yview_moveto(1)
+        self.root.update()
+        text.yview_scroll(-1, 'units')
+        self.root.update()
+        anchor = text.index('@0,0')
+        app.qa_answer += '末尾新内容\n' * 20
+        app.render_qa(streaming=True)
+        self.root.update()
+        self.assertEqual(text.index('@0,0'), anchor)
+
+    def test_burst_partials_render_once_and_final_cancels_pending_render(self):
+        app = self.app
+        generation = app.qa.generation
+        with patch.object(app, 'render_qa', wraps=app.render_qa) as render:
+            for i in range(5):
+                app.handle_qa((generation, 'partial', (app.qa_question, f'片段 {i}')))
+            self.assertEqual(render.call_count, 0)
+            self.root.update()
+            self.assertEqual(render.call_count, 1)
+            app.handle_qa((generation, 'partial', (app.qa_question, '待刷新')))
+            app.handle_qa((generation, 'answer', (app.qa_question, '最终回答')))
+            self.assertEqual(render.call_count, 2)
+            self.root.update()
+            self.assertEqual(render.call_count, 2)
+        self.assertTrue(app.qa_text.get('1.0', 'end-1c').endswith('最终回答'))

@@ -30,8 +30,8 @@ def image_item(image):
     data = output.getvalue()
     if len(data) > 8 * 1024 * 1024:
         raise ValueError('剪贴板图片超过 8 MB，请缩小后重新复制。')
-    return ClipboardItem(f'【剪贴板图片 {image.width}×{image.height}】请识别图片内容；'
-                         '如有问题请直接解答，否则概括要点。', data)
+    return ClipboardItem(f'【剪贴板图片 {image.width}×{image.height}】若图片包含题目或提问，请直接给出答案和必要的解释；'
+                         '不要只转述图片内容，也无需询问是否解答。没有问题时简要概括要点。', data)
 
 
 class WindowsClipboard:
@@ -62,13 +62,19 @@ class WindowsClipboard:
             self.user.GetWindowThreadProcessId(owner, ctypes.byref(pid))
         return pid.value == os.getpid()
 
-    def read(self):
+    def read_image(self):
         # ImageGrab supports bitmap and registered PNG clipboard formats on Windows.
         if any(self.user.IsClipboardFormatAvailable(fmt) for fmt in (8, 17, self.png_format)):
             image = ImageGrab.grabclipboard()
             if isinstance(image, Image.Image):
                 return image_item(image)
             raise OSError('图片尚未准备好')
+        return None
+
+    def read(self):
+        image = self.read_image()
+        if image is not None:
+            return image
         if not self.user.OpenClipboard(None):
             raise OSError('剪贴板暂时被占用')
         try:

@@ -22,6 +22,11 @@ if __name__ == '__main__':
             root.withdraw()
             image = tk.PhotoImage(file=str(RESOURCES / 'assets/logo-24.png'))
             get_speech_timestamps(np.zeros(16000, dtype=np.float32), VadOptions())
+            from echo_cancellation import make_processor
+            echo = make_processor()
+            echo_audio = echo.process(np.zeros(160, np.float32), np.zeros(160, np.float32))
+            if echo_audio.shape != (160,) or not np.isfinite(echo_audio).all():
+                raise RuntimeError('Packaged echo cancellation self-test failed')
             root.destroy()
             if '--verify-bundled-model' in sys.argv:
                 from model_download import cached_model, BUNDLED_MODELS
@@ -70,7 +75,7 @@ if __name__ == '__main__':
                     raise RuntimeError('GPU verification unexpectedly fell back to CPU')
                 del model
                 gpu_verified = True
-            report.write_text(json.dumps({'ok': True, 'version': app.VERSION,
+            report.write_text(json.dumps({'ok': True, 'version': app.VERSION, 'echo_verified': True,
                                          'gpu_verified': gpu_verified,
                                          'bundled_model': 'small' if '--verify-bundled-model' in sys.argv else None}), encoding='utf-8')
         except Exception:

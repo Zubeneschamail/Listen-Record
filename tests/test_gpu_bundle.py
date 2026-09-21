@@ -19,7 +19,7 @@ class GPUBundleTests(unittest.TestCase):
             path = directory / f'{package.replace("-", "_")}-{version}-py3-none-win_amd64.whl'
             with zipfile.ZipFile(path, 'w') as archive:
                 for name in bundle.REQUIRED:
-                    if name.startswith(component) and name != omit:
+                    if name.startswith('nvrtc' if component == 'cuda_nvrtc' else component) and name != omit:
                         archive.writestr(f'nvidia/{component}/bin/{name}', b'test-dll')
                 archive.writestr(package + '.dist-info/LICENSE.txt', 'NVIDIA license fixture')
                 archive.writestr(f'nvidia/{component}/bin/../../escape.dll', 'ignored')
@@ -34,14 +34,17 @@ class GPUBundleTests(unittest.TestCase):
             output = root / 'build/gpu-runtime'
             manifest = json.loads((output / 'manifest.json').read_text())
             self.assertEqual(len(list(output.rglob('*.dll'))), len(bundle.REQUIRED))
-            self.assertEqual(len(list((output / 'licenses').rglob('LICENSE.txt'))), 2)
+            self.assertEqual(len(list((output / 'licenses').rglob('LICENSE.txt'))), 3)
             self.assertIn('nvidia/cublas/bin/cublas64_12.dll', manifest['sha256'])
+            self.assertIn('nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll', manifest['sha256'])
+            self.assertIn('nvidia/cuda_nvrtc/bin/nvrtc-builtins64_124.dll', manifest['sha256'])
             self.assertFalse(list(root.rglob('escape.dll')))
 
     def test_missing_dependency_blocks_the_installer_build(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self.wheels(root, omit='cudnn64_9.dll')
-            with patch.object(bundle, 'ROOT', root):
-                with self.assertRaisesRegex(RuntimeError, 'incomplete'):
-                    bundle.stage()
+        for missing in ('cudnn64_9.dll', 'nvrtc64_120_0.dll', 'nvrtc-builtins64_124.dll'):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.wheels(root, omit=missing)
+                with patch.object(bundle, 'ROOT', root):
+                    with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+                        bundle.stage()

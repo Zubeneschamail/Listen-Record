@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 folder = Path(__file__).resolve().parents[1] / 'assets' / 'icons'
 folder.mkdir(exist_ok=True)
 scale = 4
-for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check', 'send', 'microphone', 'microphone-active', 'waveform', 'add', 'auto', 'collapse'):
+for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'maximize', 'restore', 'check', 'send', 'microphone', 'microphone-active', 'waveform', 'add', 'auto', 'collapse'):
     size = 24 if name in ('send', 'microphone', 'microphone-active', 'refresh', 'waveform', 'add') else 20
     im = Image.new('RGBA', (size*scale,size*scale))
     d = ImageDraw.Draw(im)
@@ -91,6 +91,11 @@ for name in ('settings', 'copy', 'more', 'refresh', 'close', 'minimize', 'check'
         line([(15,5),(5,15)])
     elif name == 'minimize':
         line([(4,10),(16,10)])
+    elif name == 'maximize':
+        rect((5,5,15,15))
+    elif name == 'restore':
+        line([(7,6),(7,4),(16,4),(16,13),(14,13)])
+        rect((4,7,13,16))
     elif name == 'check':
         line([(4,10),(8,14),(16,5)])
     im.resize((size,size),Image.Resampling.LANCZOS).save(folder / f'{name}.png')

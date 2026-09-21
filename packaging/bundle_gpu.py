@@ -8,8 +8,10 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGES = {'cublas': ('nvidia-cublas-cu12', '12.4.5.8'),
+            'cuda_nvrtc': ('nvidia-cuda-nvrtc-cu12', '12.4.127'),
             'cudnn': ('nvidia-cudnn-cu12', '9.1.0.70')}
 REQUIRED = {'cublas64_12.dll', 'cublasLt64_12.dll', 'cudnn64_9.dll',
+            'nvrtc64_120_0.dll', 'nvrtc-builtins64_124.dll',
             'cudnn_ops64_9.dll', 'cudnn_cnn64_9.dll', 'cudnn_graph64_9.dll'}
 
 

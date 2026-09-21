@@ -25,6 +25,7 @@ from qa_connection import QAConnection
 from clipboard_watch import ClipboardWatcher
 from qa_images import ConversationImage
 from qa_composer import QuestionComposer
+from markdown_view import MarkdownView
 from qa_provider import APIProvider, PROVIDERS, DEFAULTS, load_settings, image_input_error
 import theme
 from segmentation import PauseSegmenter, WordAssembler, decode_chunk, DraftPreview
@@ -42,6 +43,7 @@ from app_paths import DATA, LOGS, RECORDINGS, preferences, save_desktop
 from version import VERSION
 
 ROOT = Path(__file__).resolve().parent
+NO_AUDIO_DEVICE = "不选择设备"
 SIMPLIFIED = OpenCC("t2s")
 logging.basicConfig(filename=LOGS / "app.log", level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -102,10 +104,10 @@ class Transcriber:
     def emit(self, kind, value):
         self.events.put((kind, value))
 
-    def start(self, device, model, language, hotwords=""):
+    def start(self, device, model, language, hotwords="", echo_cancellation=False):
         self.stop_event.clear()
         self.context_reset.clear()
-        self.thread = threading.Thread(target=self.run, args=(device, model, language, hotwords), daemon=True)
+        self.thread = threading.Thread(target=self.run, args=(device, model, language, hotwords, echo_cancellation), daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -114,8 +116,10 @@ class Transcriber:
     def reset_context(self):
         self.context_reset.set()
 
-    def run(self, device, model_name, language, hotwords=""):
+    def run(self, device, model_name, language, hotwords="", echo_cancellation=False):
+        from echo_cancellation import capture_offset
         audio_api = None
+        echo = None
         streams, states = [], {}
         chunks = queue.Queue(maxsize=1200)
         overflow = threading.Event()
@@ -157,9 +161,11 @@ class Transcriber:
                         self.stop_event.set()
                         return (None, pa.paAbort)
                     samples = np.frombuffer(data, dtype=np.float32).reshape(-1, channels).copy()
-                    offset = max(0, time.monotonic() - origin - count / rate)
+                    offset = (capture_offset(timing, time.monotonic(), origin, count, rate) if echo
+                              else max(0, time.monotonic() - origin - count / rate))
                     try:
-                        chunks.put_nowait((source, offset, samples, time.time() - count / rate))
+                        item = (source, offset, samples, time.time() - count / rate)
+                        echo.submit(item) if echo else chunks.put_nowait(item)
                     except queue.Full:
                         overflow.set()
                         self.stop_event.set()
@@ -172,12 +178,18 @@ class Transcriber:
                                         frames_per_buffer=rate // 10, stream_callback=callback, start=False)
                 streams.append(stream)
                 state["stream"] = stream
+            if echo_cancellation and {'system', 'microphone'} <= states.keys():
+                from echo_cancellation import EchoCapture
+                echo = EchoCapture(chunks, self.stop_event,
+                                   {source: state['rate'] for source, state in states.items()}, mono_16k)
+                echo.start()
             origin = time.monotonic()
             for stream in streams:
                 stream.start_stream()
             backend = getattr(getattr(self.model, "model", None), "device", "cpu")
             source_names = " + ".join("系统声音" if x == "system" else "麦克风" for x in states)
-            self.emit("status", f"正在转写 · {'GPU' if backend == 'cuda' else 'CPU'} · {source_names}")
+            self.emit("status", f"正在转写 · {'GPU' if backend == 'cuda' else 'CPU'} · {source_names}"
+                      + (' · 回声消除已开启' if echo else ''))
 
             def transcribe(source, ready):
                 state = states[source]
@@ -195,7 +207,7 @@ class Transcriber:
                     self.emit("preview", {"source": source, "text": paragraphs.preview(source, clean_caption(pending[2]) if pending else "")})
                     state["preview"].defer()
 
-            while not self.stop_event.is_set() or not chunks.empty():
+            while not self.stop_event.is_set() or (echo and not echo.done.is_set()) or not chunks.empty():
                 if self.context_reset.is_set():
                     paragraphs.pending = None
                     for state in states.values():
@@ -218,7 +230,10 @@ class Transcriber:
                 state["received"] = time.monotonic()
                 if not self.stop_event.is_set() and any(not s["stream"].is_active() for s in states.values()):
                     raise RuntimeError("音频设备已断开或停止响应，请刷新设备后重试。")
-                audio = state["levels"].process(mono_16k(samples, state["rate"]))
+                # Do not amplify residual echo with the generic quiet-input gain.
+                # AEC mic output is already 16 kHz; system audio keeps its old path.
+                audio = (samples if echo and source == 'microphone' else
+                         state["levels"].process(mono_16k(samples, state["rate"])))
                 transcribe(source, state["segmenter"].push(audio, offset, block_epoch))
                 for paragraph in paragraphs.silence(source, offset + len(audio)/16000,
                         getattr(state['segmenter'], 'last_speech_end', None)):
@@ -246,6 +261,8 @@ class Transcriber:
                 transcribe(source, state["segmenter"].finish())
             if overflow.is_set():
                 raise RuntimeError("音频缓冲溢出或采集不连续，已停止以避免静默丢字。请选更快的模型后重试。")
+            if echo and echo.error:
+                raise RuntimeError(echo.error)
         except Exception as exc:
             logging.exception("Transcription failed")
             self.emit("error", str(exc))
@@ -258,6 +275,8 @@ class Transcriber:
                     stream.close()
                 except Exception:
                     logging.exception("Closing stream")
+            if echo:
+                echo.close()
             if audio_api:
                 audio_api.terminate()
             self.emit("preview", "")
@@ -281,14 +300,20 @@ class App:
         self.startup_pending_issues = []
         self.startup_advance_on_hide = False
         self.qa = QAWorker(self.events)
+        self.qa.track_usage = True
         self.qa.context_provider = self.session_context_snapshot
         self.qa_connection = QAConnection(self.events)
         self.qa_settings = load_settings()
+        from qa_balance import BalanceQuery
+        self.balance_query = BalanceQuery(self.events)
+        self.balance_status = tk.StringVar(value='尚未查询')
+        self.balance_detail = tk.StringVar(value='尚未更新')
         self.qa_provider_name = tk.StringVar(value=PROVIDERS[self.qa_settings['provider']])
         self.connection_status = tk.StringVar(value="尚未检测")
         self.qa_detection_state = tk.StringVar(value='unknown')
         self.connection_detail = tk.StringVar(value="点击检测会发送测试请求，消耗少量 API 额度。")
         self.dark_mode = tk.BooleanVar(value=preferences().get('dark_mode', False))
+        self.echo_cancellation = tk.BooleanVar(value=preferences().get('echo_cancellation', False))
         self.capture_hidden = tk.BooleanVar(value=preferences().get('capture_hidden', False))
         from capture_privacy import CapturePrivacy
         self.capture_privacy = CapturePrivacy(root, self.capture_hidden.get())
@@ -332,6 +357,8 @@ class App:
         self.settings_visible = False
         self.pinned = False
         self._drag_origin = None
+        self.maximized = False
+        self._restore_bounds = None
         root.title("闻录 · 系统声音实时转文字")
         icon_path = ROOT / "assets" / "wenlu.ico"
         if icon_path.exists():
@@ -388,6 +415,8 @@ class App:
         self.qa_status_label.bind('<ButtonPress-1>', self.drag_begin, add='+')
         self.qa_status_label.bind('<B1-Motion>', self.drag_move, add='+')
         button(header, "×", self.close).pack(side="right")
+        self.maximize_button = button(header, "最大化", self.toggle_maximize)
+        self.maximize_button.pack(side="right")
         button(header, "—", self.minimize).pack(side="right")
         self.settings_button = button(header, "设置", self.toggle_settings)
         self.settings_button.pack(side="right", padx=(4, 0))
@@ -474,10 +503,14 @@ class App:
                                      opaqueresize=False, proxybackground="#007ACC",
                                      proxyborderwidth=0, proxyrelief="flat")
         self.qa_rows.pack(fill="both", expand=True)
-        self.composer = QuestionComposer(self.qa_rows, self.send_question, self.font_size.get())
+        self.composer = QuestionComposer(self.qa_rows, self.send_question, self.font_size.get(),
+                                         paste_image=self.paste_question_image)
         qa_footer = self.composer.actions
         self.ask_selected_button = button(qa_footer, "发送", self.send_question)
         self.ask_selected_button.pack(side="right")
+        from context_meter import ContextMeter
+        self.context_meter = self.composer.context_meter = ContextMeter(qa_footer)
+        self.context_meter.pack(side='right', padx=(0, 2))
         from reference_settings import build_add_button
         build_add_button(self, qa_footer)
         from reference_settings import ReferencePathLabel
@@ -493,6 +526,7 @@ class App:
                               selectbackground='#E6F2FB', selectforeground='#263044')
         self.qa_text.tag_configure("question", foreground="#007ACC", spacing1=8, spacing3=10, rmargin=36)
         self.qa_text.tag_bind("question", "<Button-1>", self.edit_question)
+        self.markdown = MarkdownView(self.qa_text, self.font_size.get())
         self.qa_rows.add(self.qa_text, minsize=60, stretch="always")
         self.qa_rows.add(self.composer, minsize=80, height=126, stretch="never")
         self.composer_splitter = SplitterHandle(self.qa_rows)
@@ -640,6 +674,7 @@ class App:
 
     def apply_theme(self):
         theme.apply(self.root, self.dark_mode.get())
+        self.markdown.configure(self.font_size.get(), self.dark_mode.get())
 
     def change_theme(self):
         self.apply_theme()
@@ -649,6 +684,7 @@ class App:
         size = self.font_size.get()
         self.root._body_font_size = size
         self.qa_text.configure(font=(typography.UI_FAMILY, size))
+        self.markdown.configure(size, self.dark_mode.get())
         self.composer.set_font_size(size)
         self.text.configure(font=(typography.UI_FAMILY, size))
         for bubble in self.chat.bubbles.values():
@@ -657,6 +693,7 @@ class App:
             bubble.measured_text = None
             bubble.layout_key = None
         self.chat.resize()
+        self.render_qa()
         self.save_desktop_settings()
 
     def load_desktop_settings(self):
@@ -673,7 +710,8 @@ class App:
             save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
             save_desktop(dict(model=self.model.get(), language=self.language.get(), mode=self.mode.get(),
                               output=self.device.get(), input=self.microphone.get(), dark_mode=self.dark_mode.get(),
-                              font_size=self.font_size.get(), capture_hidden=self.capture_privacy.enabled))
+                              font_size=self.font_size.get(), capture_hidden=self.capture_privacy.enabled,
+                              echo_cancellation=self.echo_cancellation.get()))
         except OSError:
             logging.exception('Saving desktop settings')
             if raise_errors:
@@ -726,12 +764,20 @@ class App:
 
     def drag_move(self, event):
         if self._drag_origin:
+            if getattr(self, 'maximized', False):
+                ratio = self._drag_origin[0] / self.root.winfo_width()
+                offset_y = self._drag_origin[1]
+                width = self._restore_bounds[0]
+                self.toggle_maximize()
+                self._drag_origin = (round(width * ratio), offset_y)
             x, y = event.x_root - self._drag_origin[0], event.y_root - self._drag_origin[1]
             # A leading '-' means distance from the opposite screen edge in
             # Tk geometry. '+-20' is the absolute coordinate -20 instead.
             self.root.geometry(f"+{x}+{y}")
 
     def resize_begin(self, event, edge='se'):
+        if getattr(self, 'maximized', False):
+            return
         self._resize_origin = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
         self._resize_edge = edge
         self._resize_position = (self.root.winfo_rootx(), self.root.winfo_rooty())
@@ -757,6 +803,8 @@ class App:
             self._resize_preview = None
 
     def resize_move(self, event):
+        if getattr(self, 'maximized', False):
+            return
         x, y, width, height = self._resize_origin
         edge = getattr(self, '_resize_edge', 'se')
         left, top = getattr(self, '_resize_position', (self.root.winfo_rootx(), self.root.winfo_rooty()))
@@ -822,6 +870,22 @@ class App:
 
     def minimize(self):
         self.hide_to_tray()
+
+    def toggle_maximize(self):
+        self.flush_resize()
+        self.root.update_idletasks()
+        if self.maximized:
+            width, height, x, y = self._restore_bounds
+        else:
+            from window_effects import work_area
+            x, y, right, bottom = work_area(self.root)
+            self._restore_bounds = (self.root.winfo_width(), self.root.winfo_height(),
+                                    self.root.winfo_rootx(), self.root.winfo_rooty())
+            width, height = right - x, bottom - y
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+        self.maximized = not self.maximized
+        self._drag_origin = None
+        self.maximize_button.configure(text='恢复' if self.maximized else '最大化')
 
     def raise_settings(self, event=None):
         """Keep the active settings dialog above its owner without stealing input."""
@@ -914,8 +978,14 @@ class App:
 
     def refresh(self):
         try:
-            old_output = self.devices[self.device.current()]["index"] if self.device.current() >= 0 else None
-            old_input = self.input_devices[self.microphone.current()]["index"] if self.microphone.current() >= 0 else None
+            previous_devices = []
+            for widget, devices in ((self.device, self.devices), (self.microphone, self.input_devices)):
+                index = widget.current()
+                previous_devices.append((
+                    devices[index]["index"] if 0 <= index < len(devices) else None,
+                    widget.get() == NO_AUDIO_DEVICE))
+                if not widget["values"]:
+                    widget["values"] = [NO_AUDIO_DEVICE]
             with pa.PyAudio() as audio:
                 self.devices = list(audio.get_loopback_device_info_generator())
                 host = audio.get_host_api_info_by_type(pa.paWASAPI)
@@ -927,15 +997,15 @@ class App:
                 except OSError:
                     default = None
                 default_input = host.get("defaultInputDevice")
-            for widget, devices, previous, fallback in (
-                    (self.device, self.devices, old_output, default),
-                    (self.microphone, self.input_devices, old_input, default_input)):
-                widget["values"] = [d["name"] for d in devices]
-                if devices:
+            for widget, devices, (previous, unselected), fallback in (
+                    (self.device, self.devices, previous_devices[0], default),
+                    (self.microphone, self.input_devices, previous_devices[1], default_input)):
+                widget["values"] = [d["name"] for d in devices] + [NO_AUDIO_DEVICE]
+                if devices and not unselected:
                     target = previous if any(d["index"] == previous for d in devices) else fallback
                     widget.current(next((i for i, d in enumerate(devices) if d["index"] == target), 0))
                 else:
-                    widget.set("")
+                    widget.set(NO_AUDIO_DEVICE)
             if not self.devices and not self.input_devices:
                 self.status.set("未找到音频设备，请连接或启用设备后刷新。")
         except Exception as exc:
@@ -970,12 +1040,16 @@ class App:
         for source, widget, devices, enabled in (
                 ("system", self.device, self.devices, self.capture_mode.get() != "仅麦克风"),
                 ("microphone", self.microphone, self.input_devices, self.capture_mode.get() != "仅系统声音")):
-            if enabled:
-                if widget.current() < 0:
+            if enabled and widget.get() != NO_AUDIO_DEVICE:
+                if not 0 <= widget.current() < len(devices):
                     messagebox.showinfo("选择音源", "请在设置中选择" + ("系统播放设备。" if source == "system" else "麦克风输入设备。"), parent=self.root)
                     self.toggle_settings()
                     return
                 selected.append({"index": int(devices[widget.current()]["index"]), "source": source})
+        if not selected:
+            messagebox.showinfo("选择音源", "当前采集方式下未选择设备，请选择系统声音或麦克风设备。", parent=self.root)
+            self.toggle_settings()
+            return
         try:
             save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
         except OSError as exc:
@@ -1004,7 +1078,7 @@ class App:
         self.engine.start(selected,
                           self.model.get().split()[0],
                           {"中文": "zh", "英语": "en", "自动检测": None}[self.language.get()],
-                          self.hotwords.get())
+                          self.hotwords.get(), echo_cancellation=self.echo_cancellation.get())
 
     def stop(self):
         self.engine.stop()
@@ -1013,6 +1087,7 @@ class App:
 
     def clear(self, preserve_recording=False):
         self.cancel_question_edit()
+        self.context_meter.set_usage()
         self.composer.clear()
         self.clipboard_pending.clear()
         self.clipboard_request_generation = None
@@ -1216,6 +1291,14 @@ class App:
         self.clipboard_status.set(f'监听中 · {len(self.clipboard_pending)} 条待发送')
 
     def configure_qa_provider(self):
+        self.balance_query.close()
+        self.balance_status.set('尚未查询')
+        self.balance_detail.set('尚未更新')
+        supported = self.qa_settings['provider'] == 'deepseek'
+        self.balance_check_button.configure(state='normal' if supported else 'disabled')
+        if not supported:
+            self.balance_status.set('暂不支持')
+            self.balance_detail.set('当前兼容 API 未接入余额查询。')
         self.clipboard_request_generation = None
         self.qa.reset()
         self.qa_connection.close()
@@ -1224,6 +1307,7 @@ class App:
         profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
         from reference_files import load_settings as load_references
         backend = APIProvider(provider, profile, workspace_loader=load_references)
+        self.context_meter.set_usage()
         self.qa.stream_runner = backend.run
         self.qa_connection = QAConnection(self.events, preflight=backend.preflight,
             probe=backend.check_connection, name=PROVIDERS[provider], failure=backend.failure)
@@ -1243,6 +1327,31 @@ class App:
             self.connection_detail.set("正在回答，请完成后再检测。")
             return
         self.qa_connection.check(probe=True)
+
+    def check_qa_balance(self):
+        if self.balance_query.checking:
+            return
+        provider = self.qa_settings['provider']
+        profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
+        self.balance_status.set('查询中…')
+        self.balance_detail.set('正在查询账户余额…')
+        self.balance_check_button.configure(state='disabled')
+        self.balance_query.start(provider, profile)
+
+    def handle_qa_balance(self, value):
+        revision, balance, error = value
+        if revision != self.balance_query.revision or self.closing:
+            return
+        self.balance_query.checking = False
+        self.balance_check_button.configure(state='normal')
+        if error:
+            self.balance_status.set('查询失败')
+            self.balance_detail.set(error)
+            return
+        from qa_balance import balance_display
+        label, detail = balance_display(balance)
+        self.balance_status.set(label)
+        self.balance_detail.set((detail + ' · ' if detail else '') + '更新于 ' + time.strftime('%H:%M:%S'))
 
     def render_qa_connection(self):
         state = self.qa_connection.state
@@ -1335,10 +1444,23 @@ class App:
         self.qa_status.set("")
         self.render_qa()
 
+    def paste_question_image(self, event=None):
+        from clipboard_watch import WindowsClipboard
+        try:
+            item = WindowsClipboard().read_image()
+            if item is None:
+                return  # Keep Tk's normal text paste, including selection and undo.
+            self.composer.set_image(item)
+            self.qa_status.set('图片已粘贴，可输入问题后发送')
+        except (OSError, ValueError) as exc:
+            self.qa_status.set(f'图片粘贴失败：{exc}')
+        return 'break'
+
     def send_question(self):
         draft = self.composer.get()
-        if draft:
-            question = draft.strip()
+        item = self.composer.image_item
+        if draft or item is not None:
+            question = draft.strip() or (item.text if item is not None else '')
             if not question or len(question) > 2400:
                 self.qa_status.set('请输入问题，最多 2400 字')
                 self.composer.expand()
@@ -1347,8 +1469,15 @@ class App:
                 self.qa_status.set('请先检查答疑模型连接')
                 self.composer.expand()
                 return
+            if item is not None:
+                provider = self.qa_settings['provider']
+                profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
+                error = image_input_error(provider, profile)
+                if error:
+                    self.qa_status.set(error)
+                    return
             self.cancel_question_edit(preserve=True)
-            if self.select_question(question, []):
+            if self.select_question(question, [], image=item.image if item is not None else None):
                 self.composer.clear()
             return
         if (getattr(self, 'question_editor', None) is not None or self.multi_rows
@@ -1409,7 +1538,7 @@ class App:
         self.text.tag_remove("sel", "1.0", "end")
         self.chat.highlight(set())
 
-    def select_question(self, question, indices):
+    def select_question(self, question, indices, image=None):
         if not self.qa_enabled.get() or not question:
             return
         if self.qa_connection.state not in ("authenticated", "verified"):
@@ -1418,7 +1547,7 @@ class App:
         if len(question) > 2400:
             self.qa_status.set("选中内容超过 2400 字，请减少选择后发送")
             return
-        key = (tuple(indices), question)
+        key = (tuple(indices), question, image) if image is not None else (tuple(indices), question)
         if key == self.qa_selection and self.qa.active:
             self.clear_question_selection()
             return
@@ -1429,12 +1558,19 @@ class App:
         # Even identical follow-ups need a new answer against the latest history.
         self.qa_question, self.qa_answer = question, ''
         self.qa_display_images.pop(len(self.qa_display_history), None)
+        if image is not None:
+            preview = ConversationImage.from_bytes(image)
+            if preview is not None:
+                self.qa_display_images[len(self.qa_display_history)] = preview
         self.render_qa()
         self.qa_status.set("正在回答…")
         # Selected transcript context supplements the shared question/answer history.
         context = ([r["text"] for r in self.rows[max(0, indices[0]-8):indices[0]]]
                    + [self.rows[i]["text"] for i in indices]) if indices else [r["text"] for r in self.rows[-12:]]
-        self.qa.ask(question, context)
+        if image is not None:
+            self.qa.ask(question, [], image=image)
+        else:
+            self.qa.ask(question, context)
         self.clear_question_selection()
         return True
 
@@ -1450,7 +1586,7 @@ class App:
             return
         question = turns[index][0]
         if index in self.qa_display_images or question.startswith('【剪贴板图片 '):
-            self.qa_status.set('图片问题请关闭并重新开启剪贴板监听后重新复制图片')
+            self.qa_status.set('图片问题请在输入区重新粘贴图片后发送')
             return 'break'
         if getattr(self, 'question_editor', None) is not None:
             if index == self.edit_question_turn:
@@ -1543,10 +1679,22 @@ class App:
         if event.width == getattr(self, '_qa_image_width', None):
             return
         self._qa_image_width = event.width
-        if self.qa_display_images:
+        if self.qa_display_images or self.qa_question or self.qa_display_history:
             self.render_qa()
 
+    def schedule_qa_render(self):
+        if getattr(self, '_qa_render_timer', None) is None:
+            self._qa_render_timer = self.root.after_idle(self.flush_qa_render)
+
+    def flush_qa_render(self):
+        self._qa_render_timer = None
+        if not self.closing:
+            self.render_qa(streaming=True)
+
     def render_qa(self, streaming=False):
+        if getattr(self, '_qa_render_timer', None) is not None:
+            self.root.after_cancel(self._qa_render_timer)
+            self._qa_render_timer = None
         editor = getattr(self, 'question_editor', None)
         editor_focused = editor is not None and self.root.focus_get() is editor
         # Capture the old viewport before content changes.
@@ -1563,13 +1711,16 @@ class App:
         else:
             self.qa_placeholder.place(relx=0.5, rely=0.42, anchor="center")
         self.qa_text.configure(state="normal")
-        previous = self.qa_text.get("1.0", "end-1c")
         turns = self.qa_display_history + ([(self.qa_question, self.qa_answer)] if self.qa_question else [])
         images = getattr(self, 'qa_display_images', {})
-        # Text.get omits embedded images but retains their line breaks, so streaming
-        # can append only the answer without recreating thumbnails on every token.
-        current = "\n\n".join((images[index].caption + '\n\n' if index in images else question + '\n')
-                              + answer for index, (question, answer) in enumerate(turns))
+        def question_text(index, question):
+            if index in images and question.startswith('【剪贴板图片 '):
+                return ''
+            return question
+        def shape():
+            return (tuple(turns[:-1]), turns[-1][0] if turns else '',
+                    tuple((i, id(preview), preview.width) for i, preview in images.items()),
+                    self.qa_text.winfo_width())
         if editor is not None and not 0 <= self.edit_question_turn < len(turns):
             # A provider/conversation reset can remove the turn being edited.
             editor.destroy()
@@ -1579,39 +1730,49 @@ class App:
         # Preserve the visible text line, not a percentage of a growing document.
         # A fixed fraction moves the viewport down as new answers are appended.
         top_line = self.qa_text.index('@0,0')
-        if editor is None and streaming and previous and current.startswith(previous):
-            self.qa_text.insert("end", current[len(previous):])
+        incremental = (editor is None and streaming and turns and getattr(self, '_qa_rendered_shape', None) == shape()
+                       and 'qa_answer_start' in self.qa_text.mark_names())
+        if incremental:
+            self._qa_answer_spans = self.markdown.update_tail(
+                turns[-1][1], 'qa_answer_start', self._qa_answer_spans)
         else:
             if editor is not None:
                 # Detach before deleting text: otherwise Tk destroys the embedded
                 # editor, including its draft, cursor, selection and undo history.
                 self.qa_text.window_configure(str(editor), window='')
             self.qa_text.delete("1.0", "end")
+            self.qa_text.mark_unset('qa_answer_start')
+            self._qa_answer_spans = []
             for index, (question, answer) in enumerate(turns):
                 if index:
-                    self.qa_text.insert("end", "\n\n")
+                    self.qa_text.insert("end", "\n")
                 if editor is not None and index == self.edit_question_turn:
                     self.qa_text.window_create('end', window=editor, stretch=True)
                     self.qa_text.insert('end', '\n')
                 else:
                     preview = images.get(index)
-                    self.qa_text.insert("end", (preview.caption if preview else question) + "\n",
-                                        ("question", f"question_turn:{index}"))
+                    label = question_text(index, question)
+                    if label:
+                        self.markdown.insert(label, ("question", f"question_turn:{index}"))
+                        self.qa_text.insert('end', '\n', ("question", f"question_turn:{index}"))
                     if preview:
                         photo = preview.thumbnail(self.qa_text, self.qa_text.winfo_width() - 48)
                         self.qa_text.image_create('end', image=photo, padx=0, pady=4)
                         self.qa_text.insert('end', '\n')
-                self.qa_text.insert("end", answer)
+                if index == len(turns)-1:
+                    self.qa_text.mark_set('qa_answer_start', 'end-1c')
+                    self.qa_text.mark_gravity('qa_answer_start', 'left')
+                spans = self.markdown.insert(answer)
+                if index == len(turns)-1:
+                    self._qa_answer_spans = spans
+        self._qa_rendered_shape = shape()
         if follow:
-            # Wrapped/tagged text may still have pending geometry calculations.
-            # Like the transcript panel, settle layout then move to the actual
-            # bottom, rather than merely making the last index visible.
-            self.qa_text.update_idletasks()
-            self.qa_text.see('end')
-            # Tk computes wrapped line heights lazily as they enter view.
-            self.qa_text.update_idletasks()
+            # Do not pump the idle queue mid-render: it paints the intermediate
+            # layout and fights wheel/scrollbar input during streaming.
+            # Resolve wrapped-line heights without processing paint/input events.
+            self.qa_text.count('1.0', 'end', 'update', 'ypixels')
             self.qa_text.yview_moveto(1)
-        else:
+        elif not incremental:
             self.qa_text.yview(top_line)
         self.qa_text.configure(state="disabled")
         if editor_focused:
@@ -1620,14 +1781,20 @@ class App:
     def copy_answer(self):
         if self.qa_answer or self.qa_display_history:
             self.root.clipboard_clear()
-            self.root.clipboard_append(self.qa_text.get("1.0", "end-1c")
-                                       if self.qa_display_history else self.qa_answer)
+            turns = self.qa_display_history + ([(self.qa_question, self.qa_answer)] if self.qa_question else [])
+            original = '\n\n'.join(('[图片]' if i in self.qa_display_images and question.startswith('【剪贴板图片 ')
+                                     else question) + '\n\n' + answer
+                                    for i, (question, answer) in enumerate(turns))
+            self.root.clipboard_append(original if self.qa_display_history else self.qa_answer)
             self.answer_copy_button.configure(text="已复制")
             self.root.after(1500, lambda: self.answer_copy_button.configure(text="复制"))
 
     def handle_qa(self, value):
         generation, state, payload = value
         if generation != self.qa.generation or not self.qa.enabled or self.closing:
+            return
+        if state == 'usage':
+            self.context_meter.set_usage(payload)
             return
         replacement = getattr(self, 'qa_replacement', None)
         if replacement and replacement[0] == generation and state in ('thinking', 'partial', 'answer'):
@@ -1665,11 +1832,13 @@ class App:
                         self.qa_status.set('回答已显示，但保存失败；可复制回答')
             return
         if state == "thinking":
+            prepared_image = (self.qa.source == 'manual' and self.qa_selection is not None
+                              and self.qa_question == payload and not self.qa_answer)
             self.qa_selection = None
             if self.qa_question and (self.qa_question != payload or self.qa_answer):
                 self.qa_display_history.append((self.qa_question, self.qa_answer))
             self.qa_question, self.qa_answer = payload, ""
-            if self.qa.source != 'clipboard':
+            if self.qa.source != 'clipboard' and not prepared_image:
                 self.qa_display_images.pop(len(self.qa_display_history), None)
             self.render_qa()
             self.qa_status.set("正在回答…")
@@ -1681,7 +1850,7 @@ class App:
             self.qa_pending_image_context = (generation, payload)
         elif state == "partial":
             self.qa_question, self.qa_answer = payload
-            self.render_qa(streaming=True)
+            self.schedule_qa_render()
         elif state == "answer":
             self.qa_connection.record()
             self.qa_question, self.qa_answer = payload
@@ -1804,6 +1973,8 @@ class App:
                 self.handle_clipboard(value)
             elif kind == "qa_connection":
                 self.render_qa_connection()
+            elif kind == 'qa_balance':
+                self.handle_qa_balance(value)
             elif kind == "hotkey":
                 if not self.root.grab_current():
                     self.toggle_recording()
@@ -1881,6 +2052,7 @@ class App:
         self.stop_clipboard()
         self.qa.set_enabled(False)
         self.qa_connection.close()
+        self.balance_query.close()
         self.hotkey.close()
         if self.busy:
             self.stop()

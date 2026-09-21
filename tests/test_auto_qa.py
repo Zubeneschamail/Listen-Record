@@ -106,6 +106,7 @@ class AutoQATests(unittest.TestCase):
                 generation = app.qa.generation
                 app.handle_qa((generation, 'thinking', '模型怎么训练？'))
                 app.handle_qa((generation, 'partial', ('模型怎么训练？', '先准备')))
+                root.update_idletasks()  # Flush the coalesced streaming render.
                 visible = app.qa_text.get('1.0', 'end-1c')
                 self.assertIn('什么是大模型？\n示例答案', visible)
                 self.assertIn('模型怎么训练？\n先准备', visible)

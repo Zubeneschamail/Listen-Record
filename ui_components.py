@@ -459,7 +459,7 @@ class UIControls:
     def button(self, parent, text, command, primary=False, width=None):
         surface = parent.cget("bg") if isinstance(parent, tk.Frame) else "#f7f8fa"
         icons = {"设置": "settings", "复制全文": "copy", "复制": "copy", "···": "more",
-                 "刷新": "refresh", "×": "close", "—": "minimize", "发送": "send",
+                 "刷新": "refresh", "×": "close", "—": "minimize", "最大化": "maximize", "发送": "send",
                  "开始转写": "waveform", "停止转写": "waveform", "添加资料": "add"}
         factory = IconButton if text in icons else tk.Button
         widget = factory(parent, **({"icon": icons[text]} if text in icons else {}),

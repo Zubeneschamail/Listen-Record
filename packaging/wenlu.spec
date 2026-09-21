@@ -1,5 +1,5 @@
 # Build using: python -m PyInstaller packaging/wenlu.spec --noconfirm
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata, collect_delvewheel_libs_directory
 from pathlib import Path
 root = Path(SPECPATH).parent
 assets = [(str(root / 'assets'), 'assets')]
@@ -9,11 +9,12 @@ if not (bundled / 'model.bin').is_file():
 assets.append((str(bundled), 'bundled-models/small'))
 for package in ['faster_whisper', 'opencc', 'certifi']:
     assets += collect_data_files(package)
-for package in ['faster-whisper', 'huggingface-hub', 'tokenizers', 'tqdm']:
+for package in ['faster-whisper', 'huggingface-hub', 'tokenizers', 'tqdm', 'pywebrtc-audio', 'mistune']:
     assets += copy_metadata(package)
 binaries = []
 for package in ['ctranslate2', 'onnxruntime', 'pyaudiowpatch']:
     binaries += collect_dynamic_libs(package)
+assets, binaries = collect_delvewheel_libs_directory('pywebrtc_audio', datas=assets, binaries=binaries)
 a = Analysis([str(root / 'launcher.py')], pathex=[str(root)], binaries=binaries, datas=assets,
              hiddenimports=['pystray._win32', 'PIL.Image', 'scipy.special._cdflib'],
              excludes=['torch', 'tensorflow', 'matplotlib', 'pytest'], noarchive=False)

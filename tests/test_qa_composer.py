@@ -96,6 +96,136 @@ class ComposerTests(unittest.TestCase):
             self.assertEqual(self.app.qa.generation, generation)
             self.assertFalse(self.app.qa.active)
 
+    def test_markdown_streaming_reformats_current_answer_and_keeps_history(self):
+        app = self.app
+        app.qa_display_history = [('早先问题', '**早先回答**')]
+        app.qa_question, app.qa_answer = '当前问题', '**正在'
+        app.render_qa()
+        app.composer.input.insert('1.0', '未发送草稿')
+        app.qa_answer = '**正在回答**\n\n```python\nprint(1)\n```'
+        app.render_qa(streaming=True)
+        visible = app.qa_text.get('1.0', 'end-1c')
+        self.assertIn('早先问题\n早先回答', visible)
+        self.assertIn('当前问题\n正在回答', visible)
+        self.assertIn('print(1)', visible)
+        self.assertNotIn('**', visible)
+        self.assertNotIn('```', visible)
+        self.assertTrue(app.qa_text.tag_ranges('md:codeblock'))
+        self.assertEqual(app.composer.get(), '未发送草稿')
+        self.assertEqual(app.qa_answer, '**正在回答**\n\n```python\nprint(1)\n```')
+
+    def test_markdown_question_editing_and_copy_keep_original_source(self):
+        from types import SimpleNamespace
+        app = self.app
+        app.qa_question, app.qa_answer = '**原始问题**', '# 标题\n\n`代码`'
+        app.render_qa()
+        self.root.update()
+        start = app.qa_text.tag_ranges('question_turn:0')[0]
+        x, y, _, _ = app.qa_text.bbox(start)
+        app.edit_question(SimpleNamespace(x=x+1, y=y+1))
+        self.assertEqual(app.question_editor.get('1.0', 'end-1c'), '**原始问题**')
+        app.cancel_question_edit()
+        with patch.object(self.root, 'clipboard_clear'), patch.object(self.root, 'clipboard_append') as copy:
+            app.copy_answer()
+            copy.assert_called_with('# 标题\n\n`代码`')
+            app.qa_display_history = [('**历史问题**', '```python\nx = 1\n```')]
+            app.render_qa()
+            app.copy_answer()
+            self.assertIn('**历史问题**', copy.call_args.args[0])
+            self.assertIn('```python', copy.call_args.args[0])
+
+    def test_pasted_image_is_a_removable_draft_and_survives_layout_changes(self):
+        from clipboard_watch import image_item
+        from PIL import Image
+        composer = self.app.composer
+        item = image_item(Image.new('RGB', (320, 180), '#007ACC'))
+        composer.input.insert('1.0', '解释图片')
+        generation = self.app.qa.generation
+        with patch('clipboard_watch.WindowsClipboard.read_image', return_value=item):
+            composer.input.event_generate('<<Paste>>')
+        self.root.update()
+        self.assertIs(composer.image_item, item)
+        self.assertTrue(composer.attachment.winfo_ismapped())
+        self.assertEqual(composer.get(), '解释图片')
+        self.assertEqual(self.app.qa.generation, generation)
+        composer.collapse()
+        self.root.update()
+        self.assertFalse(composer.attachment.winfo_ismapped())
+        composer.expand()
+        self.app.dark_mode.set(True)
+        self.app.apply_theme()
+        self.root.geometry('420x280')
+        self.root.update()
+        self.assertIs(composer.image_item, item)
+        self.assertTrue(composer.attachment.winfo_ismapped())
+        self.assertGreater(composer.input.winfo_width(), 0)
+        composer.remove_image_button.invoke()
+        self.root.update()
+        self.assertIsNone(composer.image_item)
+        self.assertFalse(composer.attachment.winfo_ismapped())
+        self.assertEqual(composer.get(), '解释图片')
+
+    def test_image_and_text_send_together_and_preview_survives_streaming(self):
+        from clipboard_watch import image_item
+        from PIL import Image
+        requests = []
+        def stream(prompt, cancel, partial, **kwargs):
+            requests.append((prompt, kwargs))
+            if 'image_context' in kwargs:
+                kwargs['image_context']('图片里有三个蓝色方块')
+            partial('分析中')
+            return '分析结果'
+        self.app.qa.stream_runner = stream
+        self.app.qa_settings['provider'] = 'deepseek'
+        self.app.qa_settings['profiles']['deepseek']['model'] = 'deepseek-v4-pro'
+        composer = self.app.composer
+        item = image_item(Image.new('RGB', (80, 60), 'blue'))
+        composer.set_image(item)
+        composer.input.insert('1.0', '图中有多少个方块？')
+        self.app.ask_selected_button.invoke()
+        self.finish()
+        self.assertEqual(requests[0][1]['image'], item.image)
+        self.assertIn('图中有多少个方块？', requests[0][0])
+        self.assertIsNone(composer.image_item)
+        self.assertEqual(composer.get(), '')
+        self.assertEqual(len(self.app.qa_text.image_names()), 1)
+        self.assertIn('图中有多少个方块？', self.app.qa_text.get('1.0', 'end'))
+        composer.input.insert('1.0', '它们是什么颜色？')
+        self.app.send_question()
+        self.finish()
+        self.assertIn('图片里有三个蓝色方块', str(requests[1][1]['history']))
+        self.assertEqual(len(self.app.qa_text.image_names()), 1)
+        self.assertNotIn('image', requests[1][1])
+
+    def test_image_only_submission_and_failed_validation_keep_attachment(self):
+        from clipboard_watch import image_item
+        from PIL import Image
+        composer = self.app.composer
+        item = image_item(Image.new('RGB', (80, 60), 'blue'))
+        composer.set_image(item)
+        self.app.qa_connection.state = 'unavailable'
+        self.app.send_question()
+        self.assertIs(composer.image_item, item)
+        self.app.qa_connection.state = 'verified'
+        with patch('app.image_input_error', return_value='模型不支持图片'):
+            self.app.send_question()
+        self.assertIs(composer.image_item, item)
+        with patch.object(self.app.qa, 'ask') as ask, patch('app.image_input_error', return_value=''):
+            self.app.send_question()
+        self.assertEqual(ask.call_args.args[0], item.text)
+        self.assertEqual(ask.call_args.kwargs['image'], item.image)
+        self.assertIsNone(composer.image_item)
+
+    def test_paste_failure_preserves_draft_and_text_paste_uses_native_handler(self):
+        composer = self.app.composer
+        composer.input.insert('1.0', '原有文字')
+        with patch('clipboard_watch.WindowsClipboard.read_image', side_effect=OSError('剪贴板被占用')):
+            self.assertEqual(self.app.paste_question_image(), 'break')
+        self.assertIn('剪贴板被占用', self.app.qa_status.get())
+        self.assertEqual(composer.get(), '原有文字')
+        with patch('clipboard_watch.WindowsClipboard.read_image', return_value=None):
+            self.assertIsNone(self.app.paste_question_image())
+
     def test_ctrl_enter_replaces_selection_with_newline_without_sending(self):
         composer = self.app.composer
         self.root.focus_force()

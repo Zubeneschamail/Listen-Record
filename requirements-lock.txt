@@ -14,12 +14,14 @@ httpcore==1.0.9
 httpx==0.28.1
 huggingface_hub==1.30.0
 idna==3.19
+mistune==3.3.4
 numpy==2.5.3
 onnxruntime==1.29.0
 opencc-python-reimplemented==0.1.7
 packaging==26.3
 protobuf==7.36.1
 PyAudioWPatch==0.2.12.8
+pywebrtc-audio==0.2.0
 PyYAML==6.0.3
 scipy==1.18.1
 tokenizers==0.23.2

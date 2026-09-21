@@ -8,7 +8,7 @@ class SettingsSession:
         self.app = app
         self.values = [(widget, widget.get()) for widget in
                        (app.model, app.language, app.mode, app.device, app.microphone,
-                        app.hotwords, app.dark_mode, app.font_size, app.capture_hidden)]
+                        app.hotwords, app.dark_mode, app.font_size, app.capture_hidden, app.echo_cancellation)]
         self.pinned = app.pinned
         self.references = app.reference_controls['snapshot']()
         app.settings_auto_qa.set(app.auto_qa.get())
