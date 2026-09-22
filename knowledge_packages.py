@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import time
+from urllib.parse import urlsplit
 
 from knowledge_embedding import FILES, QUERY_PREFIX, REPO, REVISION, Encoder, check_cancel
 
@@ -22,6 +23,7 @@ INSTRUCTIONS = (
     '个人经历、职责、时间和业绩数字必须有资料依据，禁止把团队成果说成本人贡献，'
     '禁止把通用技术方案或历史 AI 回复说成客户经历；此规则优先于合理补全经历的通用写作规则。'
     '回答引用知识包时注明片段给出的来源、章节和页码或行范围。'
+    '片段含网页地址时可引用该地址；网页内容为抓取时间的快照，不代表实时信息。'
     '已取得片段时直接依据内容作答，无需为了证明查阅再次调用普通文件工具。'
     '知识包中只有切分原文，不等于读过原文件全文；查证内容缺失时明确说明未提供，'
     '不编造出处或数字。检索分数不表示事实可信度。'
@@ -100,6 +102,36 @@ def inspect_package(path):
         return manifest
     except (sqlite3.Error, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ValueError('无法读取知识包，请使用生成工具重新构建。') from exc
+
+
+def webpage_sources(manifest):
+    """Optional provenance; keep URLs separate from validated relative source paths."""
+    documents = manifest.get('documents', [])
+    if not isinstance(documents, list):
+        raise ValueError('知识包资料清单无效。')
+    result = {}
+    for doc in documents:
+        if not isinstance(doc, dict) or 'source_url' not in doc:
+            continue
+        for key in ('source_url', 'final_url'):
+            value = doc.get(key)
+            if not isinstance(value, str) or len(value) > 2048 or re.search(r'[\s\x00-\x1f\x7f]', value):
+                raise ValueError('知识包网页来源无效。')
+            try:
+                parsed = urlsplit(value)
+                if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+                    raise ValueError()
+                parsed.port
+            except ValueError as exc:
+                raise ValueError('知识包网页来源无效。') from exc
+        for key, limit in (('source', 2048), ('title', 200), ('fetched_at', 64)):
+            if not isinstance(doc.get(key), str) or not 1 <= len(doc[key]) <= limit:
+                raise ValueError('知识包网页元数据无效。')
+        if doc['source'] in result:
+            raise ValueError('知识包网页来源重复。')
+        result[doc['source']] = {'网页地址': doc['source_url'], '最终地址': doc['final_url'],
+                                 '网页标题': doc['title'], '抓取时间': doc['fetched_at']}
+    return result
 
 
 def validate_selection(paths):
@@ -258,6 +290,7 @@ class KnowledgeLibrary:
             for rank, row_id in enumerate(ranking, 1):
                 ranks[row_id] = ranks.get(row_id, 0) + 1 / (60 + rank)
         mapping = {row['rowid']: row for row in rows}
+        provenance = webpage_sources(manifest)
         result = []
         for row_id in sorted(ranks, key=lambda k: (-ranks[k], k))[:8]:
             row = mapping.get(row_id)
@@ -266,4 +299,5 @@ class KnowledgeLibrary:
             result.append({'来源': f'kb{index}/{path.name}/{row["source"]}', '章节': row['section'],
                            '页码': row['page'], '起始行': row['line_start'], '结束行': row['line_end'],
                            '原文': row['text'], 'score': ranks[row_id]})
+            result[-1].update(provenance.get(row['source'], {}))
         return result

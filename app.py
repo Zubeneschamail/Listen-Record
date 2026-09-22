@@ -2100,6 +2100,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
     migrate_legacy()
     app = App(tk.Tk())
+    from knowledge_import import start_import_server
+    import_server = None
+    try:
+        import_server = start_import_server(app)
+    except OSError as exc:
+        app.qa_status.set('一键导入服务未启动，仍可手动添加知识包：' + str(exc))
     instance.poll(app.root)
     from desktop_dialogs import background_update_check
     app.root.after(8000, background_update_check, app)
@@ -2118,4 +2124,6 @@ if __name__ == "__main__":
     try:
         app.root.mainloop()
     finally:
+        if import_server is not None:
+            import_server.close()
         instance.close()

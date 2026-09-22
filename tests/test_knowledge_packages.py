@@ -1,4 +1,5 @@
 import hashlib
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -70,6 +71,26 @@ class KnowledgeTests(unittest.TestCase):
         self.assertIn('outbox', value)
         self.assertIn('kb1/test.wlkb/项目.md', value)
         self.assertLess(len(value.encode()), kb.MAX_CONTEXT_BYTES + 300)
+
+    def test_web_provenance_in_context_and_invalid_urls_rejected(self):
+        document = {'source': '项目.md', 'source_url': 'https://example.com/article',
+                    'final_url': 'https://example.com/article', 'title': '消息可靠性',
+                    'fetched_at': '2026-09-22T00:00:00+00:00'}
+        def update(doc):
+            with closing(sqlite3.connect(self.path)) as connection:
+                manifest = json.loads(connection.execute("SELECT value FROM metadata WHERE key='manifest'").fetchone()[0])
+                manifest['documents'] = [doc]
+                connection.execute("UPDATE metadata SET value=? WHERE key='manifest'", (json.dumps(manifest),))
+                connection.commit()
+        update(document)
+        value = json.loads(kb.KnowledgeLibrary().context(self.settings, make_prompt('', '消息失败如何补发'), [], threading.Event()))
+        self.assertEqual(value['片段'][0]['网页地址'], document['source_url'])
+        self.assertEqual(value['片段'][0]['抓取时间'], document['fetched_at'])
+        self.assertIn('项目.md', value['片段'][0]['来源'])
+        for url in ('javascript:alert(1)', 'file:///secret', 'https://u:p@example.com', 'https://example.com/\ntext'):
+            update(dict(document, source_url=url))
+            with self.assertRaisesRegex(RuntimeError, '网页来源无效'):
+                kb.KnowledgeLibrary().context(self.settings, make_prompt('', '消息失败'), [], threading.Event())
 
     def test_disabled_and_explicit_no_read(self):
         library = kb.KnowledgeLibrary()

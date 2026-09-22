@@ -227,6 +227,17 @@ def build(app, parent):
         selected_path.set('选择资料可查看完整路径。')
         refresh()
 
+    def import_paths(paths):
+        # External imports commit immediately; they must never become an unsaved settings draft.
+        if app.settings_visible:
+            raise ValueError('请先保存或取消闻录设置，再导入知识包。')
+        updated = {'enabled': True, 'paths': list(paths)}
+        save_settings(updated)
+        restore(updated)
+        app.qa_selection = None
+        # Even replacing the same managed path may contain a newer package revision.
+        app.reset_knowledge_context()
+
     def add(values):
         if not values:
             return
@@ -292,7 +303,8 @@ def build(app, parent):
     app.reference_controls = dict(listing=listing, enabled=enabled, add=add, remove=remove,
                                   add_files=add_files, add_folder=add_folder, add_packages=add_packages,
                                   paths=lambda: list(settings['paths']), remove_path=remove_path,
-                                  snapshot=snapshot, restore=restore, persist=lambda: save_settings(snapshot()))
+                                  snapshot=snapshot, restore=restore, persist=lambda: save_settings(snapshot()),
+                                  import_paths=import_paths)
     refresh()
 
 
