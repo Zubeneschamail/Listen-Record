@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import time
 import tkinter as tk
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ from unittest.mock import patch
 import httpx
 
 from knowledge_embedding import Encoder
-from knowledge_import import ImportServer, import_into_app
+from knowledge_import import ImportServer, import_into_app, import_snapshot, prepare_import
 from test_knowledge_packages import write_package
 
 
@@ -151,3 +152,95 @@ class KnowledgeImportTests(unittest.TestCase):
                 for timer in root.tk.call('after', 'info'):
                     root.after_cancel(timer)
                 root.destroy()
+
+    def test_background_copy_keeps_ui_alive_and_commits_on_ui_thread(self):
+        self.check_background_import(change_settings=False)
+
+    def test_settings_changed_during_copy_discards_pending_import(self):
+        self.check_background_import(change_settings=True)
+
+    def test_close_during_copy_never_publishes_and_removes_temporary(self):
+        root = tk.Tk()
+        root.withdraw()
+        release, cleaned = threading.Event(), threading.Event()
+        def prepare(path):
+            snapshot = import_snapshot(self.app)
+            def work():
+                if not release.wait(5):
+                    raise RuntimeError('release timeout')
+                return prepare_import(path, snapshot, self.folder / 'data')
+            return work
+        server = ImportServer(root, lambda _: self.fail('published after closing'),
+                              self.folder / 'data', prepare=prepare)
+        request = {'path': str(self.package), 'done': threading.Event(), 'expires': time.monotonic() + 25}
+        server.requests.put(request)
+        try:
+            deadline = time.monotonic() + 5
+            while server.active is None:
+                self.assertLess(time.monotonic(), deadline)
+                root.update()
+                time.sleep(.01)
+            future = server.active[1]
+            server.close()
+            future.add_done_callback(lambda _: cleaned.set())
+            release.set()
+            self.assertTrue(cleaned.wait(5))
+            self.assertFalse(request['result']['ok'])
+            self.assertEqual(self.settings['paths'], [])
+            self.assertEqual(list((self.folder / 'data' / 'knowledge-packages').iterdir()), [])
+        finally:
+            release.set()
+            if not server.closed:
+                server.close()
+            root.destroy()
+
+    def check_background_import(self, change_settings):
+        root = tk.Tk()
+        root.withdraw()
+        started, release = threading.Event(), threading.Event()
+        heartbeat = []
+        def prepare(path):
+            self.assertIs(threading.current_thread(), threading.main_thread())
+            snapshot = import_snapshot(self.app)
+            def work():
+                self.assertIsNot(threading.current_thread(), threading.main_thread())
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError('UI blocked during copy')
+                return prepare_import(path, snapshot, self.folder / 'data')
+            return work
+        def commit(prepared):
+            self.assertIs(threading.current_thread(), threading.main_thread())
+            return prepared.commit(self.app)
+        def tick():
+            if started.is_set():
+                heartbeat.append(True)
+                if change_settings:
+                    self.settings['enabled'] = True
+                release.set()
+            else:
+                root.after(10, tick)
+        server = ImportServer(root, commit, self.folder / 'data', prepare=prepare)
+        try:
+            root.after(10, tick)
+            with httpx.Client(trust_env=False, timeout=10) as client, ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(client.post, f'http://127.0.0.1:{server.server.server_port}/import',
+                                     headers={'Authorization': 'Bearer ' + server.token}, json={'path': str(self.package)})
+                deadline = time.monotonic() + 10
+                while not future.done():
+                    self.assertLess(time.monotonic(), deadline)
+                    root.update()
+                    time.sleep(.01)
+                result = future.result().json()
+                self.assertEqual(result['ok'], not change_settings, result)
+                self.assertTrue(heartbeat)
+                if change_settings:
+                    self.assertIn('设置发生变化', result['error'])
+                    self.assertEqual(self.settings['paths'], [])
+                else:
+                    self.assertEqual(self.settings['paths'], [result['path']])
+                self.assertEqual(list((self.folder / 'data' / 'knowledge-packages').glob('import-*')), [])
+        finally:
+            release.set()
+            server.close()
+            root.destroy()

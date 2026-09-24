@@ -1,5 +1,7 @@
 """Authenticated local handoff and managed storage for Builder knowledge packages."""
 import hashlib
+from concurrent.futures import Future
+from dataclasses import dataclass
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -42,9 +44,59 @@ def _hash(path):
 
 
 def import_into_app(app, source, data=DATA):
-    from knowledge_packages import inspect_package, validate_selection, webpage_sources
+    snapshot = import_snapshot(app)
+    prepared = prepare_import(source, snapshot, data)
+    return prepared.commit(app)
+
+
+def import_snapshot(app):
     if app.settings_visible:
         raise ValueError('闻录设置窗口正在编辑，请先保存或取消设置，再点击导入。')
+    return app.reference_controls['snapshot']()
+
+
+@dataclass
+class PreparedImport:
+    temporary: Path
+    target: Path
+    manifest: dict
+    paths: list
+    snapshot: dict
+
+    def discard(self):
+        self.temporary.unlink(missing_ok=True)
+
+    def commit(self, app):
+        backup = None
+        published = False
+        try:
+            if import_snapshot(app) != self.snapshot:
+                raise ValueError('导入过程中资料设置发生变化，请重新点击导入。')
+            if self.target.exists():
+                backup = self.temporary.with_suffix('.backup')
+                self.target.replace(backup)
+            self.temporary.replace(self.target)
+            published = True
+            try:
+                app.reference_controls['import_paths'](self.paths + [str(self.target)])
+            except Exception:
+                self.target.unlink(missing_ok=True)
+                published = False
+                raise
+        finally:
+            self.discard()
+            if backup is not None:
+                if published:
+                    backup.unlink(missing_ok=True)
+                else:
+                    backup.replace(self.target)
+        return {'name': self.manifest['name'], 'path': str(self.target),
+                'customer_id': self.manifest['customer_id']}
+
+
+def prepare_import(source, snapshot, data=DATA):
+    """Validate and copy on a worker; publish only after returning to the UI thread."""
+    from knowledge_packages import inspect_package, validate_selection, webpage_sources
     source = Path(source).resolve(strict=True)
     manifest = inspect_package(source)
     webpage_sources(manifest)
@@ -53,7 +105,7 @@ def import_into_app(app, source, data=DATA):
     identity = hashlib.sha256(json.dumps([manifest['customer_id'], manifest['package_id']]).encode()).hexdigest()[:32]
     target = folder / (identity + '.wlkb')
     paths = []
-    for value in app.reference_controls['snapshot']()['paths']:
+    for value in snapshot['paths']:
         if Path(value).suffix.lower() == '.wlkb':
             old = inspect_package(value)
             if (old['customer_id'], old['package_id']) == (manifest['customer_id'], manifest['package_id']):
@@ -66,38 +118,22 @@ def import_into_app(app, source, data=DATA):
     handle, name = tempfile.mkstemp(suffix='.wlkb', prefix='import-', dir=folder)
     os.close(handle)
     temporary = Path(name)
-    backup = None
-    published = False
     try:
         before = _hash(source)
         shutil.copyfile(source, temporary)
         if _hash(temporary) != before or _hash(source) != before or inspect_package(temporary) != manifest:
             raise ValueError('知识包在导入时发生变化，请生成完成后重试。')
-        if target.exists():
-            backup = folder / (temporary.stem + '.backup')
-            target.replace(backup)
-        temporary.replace(target)
-        published = True
-        try:
-            app.reference_controls['import_paths'](paths + [str(target)])
-        except Exception:
-            target.unlink(missing_ok=True)
-            published = False
-            raise
-    finally:
+        return PreparedImport(temporary, target, manifest, paths, snapshot)
+    except BaseException:
         temporary.unlink(missing_ok=True)
-        if backup is not None:
-            if published:
-                backup.unlink(missing_ok=True)
-            else:
-                backup.replace(target)
-    return {'name': manifest['name'], 'path': str(target), 'customer_id': manifest['customer_id']}
+        raise
 
 
 class ImportServer:
-    """Network threads only enqueue work; package/settings/UI changes run on Tk's thread."""
-    def __init__(self, root, callback, data=DATA):
+    """Disk preparation runs in a worker; final package/settings changes run on Tk."""
+    def __init__(self, root, callback, data=DATA, prepare=None):
         self.root, self.callback, self.data = root, callback, Path(data)
+        self.prepare, self.active = prepare, None
         self.data.mkdir(parents=True, exist_ok=True)
         self.requests = queue.Queue(maxsize=8)
         self.token = secrets.token_urlsafe(32)
@@ -151,7 +187,7 @@ class ImportServer:
                 except (ValueError, KeyError, TypeError, OSError, queue.Full):
                     self.reply(400, {'ok': False, 'error': '导入请求无效或闻录正忙。'})
                     return
-                if request['done'].wait(30):
+                if request['done'].wait(600):
                     self.reply(200, request['result'])
                 else:
                     self.reply(408, {'ok': False, 'error': '闻录未及时处理导入，请检查闻录窗口。'})
@@ -173,6 +209,22 @@ class ImportServer:
         self.timer = None
         if self.closed:
             return
+        if self.active is not None:
+            request, future = self.active
+            if future.done():
+                self.active = None
+                prepared = None
+                try:
+                    prepared = future.result()
+                    request['result'] = dict(self.callback(prepared), ok=True)
+                except Exception as exc:
+                    request['result'] = {'ok': False, 'error': str(exc)}
+                finally:
+                    if prepared is not None:
+                        prepared.discard()
+                    request['done'].set()
+            self.timer = self.root.after(100, self.poll)
+            return
         try:
             request = self.requests.get_nowait()
         except queue.Empty:
@@ -181,15 +233,45 @@ class ImportServer:
             try:
                 if time.monotonic() >= request['expires']:
                     raise ValueError('导入请求已过期，请重新点击导入。')
-                request['result'] = dict(self.callback(request['path']), ok=True)
+                if self.prepare is None:
+                    request['result'] = dict(self.callback(request['path']), ok=True)
+                else:
+                    work = self.prepare(request['path'])
+                    future = Future()
+                    def run():
+                        try:
+                            future.set_result(work())
+                        except BaseException as exc:
+                            future.set_exception(exc)
+                    self.active = request, future
+                    threading.Thread(target=run, daemon=True).start()
             except Exception as exc:
                 request['result'] = {'ok': False, 'error': str(exc)}
             finally:
-                request['done'].set()
+                if 'result' in request:
+                    request['done'].set()
         self.timer = self.root.after(100, self.poll)
 
     def close(self):
         self.closed = True
+        if self.active is not None:
+            request, future = self.active
+            request['result'] = {'ok': False, 'error': '闻录已关闭，导入未完成。'}
+            request['done'].set()
+            def discard(finished):
+                try:
+                    finished.result().discard()
+                except BaseException:
+                    pass
+            future.add_done_callback(discard)
+            self.active = None
+        while True:
+            try:
+                pending = self.requests.get_nowait()
+            except queue.Empty:
+                break
+            pending['result'] = {'ok': False, 'error': '闻录已关闭，导入未完成。'}
+            pending['done'].set()
         if self.timer is not None:
             try:
                 self.root.after_cancel(self.timer)
@@ -206,12 +288,17 @@ class ImportServer:
 
 
 def start_import_server(app):
-    def receive(path):
-        result = import_into_app(app, path)
+    def prepare(path):
+        snapshot = import_snapshot(app)
+        app.qa_status.set('正在校验并复制知识包…')
+        return lambda: prepare_import(path, snapshot)
+
+    def receive(prepared):
+        result = prepared.commit(app)
         app.open_qa()
         app.root.deiconify()
         app.root.lift()
         app.qa_status.set('已导入知识包：' + result['name'])
         return result
     register_launcher()
-    return ImportServer(app.root, receive)
+    return ImportServer(app.root, receive, prepare=prepare)

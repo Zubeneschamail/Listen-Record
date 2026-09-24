@@ -168,14 +168,22 @@ class ChatView(tk.Frame):
         if not self.bubbles:
             # An empty packed frame retains its previous requested height.
             self.inner.configure(height=1)
+            # The canvas window can retain that previous height even after the
+            # frame's children are destroyed.  Force the empty window to one
+            # pixel until the next bubble restores content-driven sizing.
+            self.canvas.itemconfigure(self.inner_id, height=1)
             self.canvas.configure(scrollregion=(0, 0, self.canvas.winfo_width(), 1))
             self.canvas.yview_moveto(0)
             self.scrollbar.set(0, 1)
         else:
+            # A fixed height is only used while the transcript is empty.
+            self.canvas.itemconfigure(self.inner_id, height=0)
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def resize(self, event=None):
         follow = self.canvas.yview()[1] >= .995
+        if self.bubbles:
+            self.canvas.itemconfigure(self.inner_id, height=0)
         width = max(120, self.canvas.winfo_width()-14-self.scrollbar.inset)
         self.canvas.itemconfigure(self.inner_id, width=width)
         for bubble in self.bubbles.values():
@@ -253,6 +261,13 @@ class ChatView(tk.Frame):
         for bubble in self.bubbles.values():
             bubble.destroy()
         self.bubbles.clear()
+        # Destroying packed children only updates the embedded frame on the
+        # next idle pass.  A new transcript can arrive before that pass (for
+        # example, immediately after clearing and starting a recording), and
+        # would then inherit the old conversation's scroll height.  Collapse
+        # the frame synchronously so the first new bubble starts at the top.
+        self.inner.configure(height=1)
+        self.canvas.itemconfigure(self.inner_id, height=1)
         self.update_scroll_region()
 
     def highlight(self, indices):
