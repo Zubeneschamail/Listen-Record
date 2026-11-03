@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import ttk
 from ui_components import UIControls, SettingsTabs, ScrollPage, StatusIndicator
 from app_paths import DATA, RECORDINGS
-from recognition import read_preferences
+from recognition import read_preferences, INTERVIEW_HOTWORDS, add_interview_hotwords
 
 
 def build_settings(app, button):
@@ -75,8 +75,9 @@ def build_settings(app, button):
         anchor='w', pady=(4, 10))
     ui.section(audio, '识别设置')
     field = ui.row(audio, '转录模型')
-    app.model = ui.combo(field, values=['small · 轻量准确', 'large-v3-turbo · 高性能', 'base · 均衡', 'tiny · 更快'])
-    app.model.current(0)
+    from qwen_engine import MODEL_LABELS, QWEN_MODEL, QWEN_HELP, default_model_label
+    app.model = ui.combo(field, values=list(MODEL_LABELS))
+    app.model.current(MODEL_LABELS.index(default_model_label()))
     app.model_label = tk.StringVar(value=app.model.get())
     app.model.configure(textvariable=app.model_label)
     app.model_manage_button = button(field, '', app.open_model_manager)
@@ -88,9 +89,31 @@ def build_settings(app, button):
     app.language.pack(fill='x')
     field = ui.row(audio, '热词 / 纠错')
     app.hotwords = tk.StringVar(value=read_preferences(DATA / 'recognition-settings.json'))
+    presets = ttk.Menubutton(field, text='面试术语')
+    app.hotwords_presets = tk.Menu(presets, tearoff=False)
+    for topic in INTERVIEW_HOTWORDS:
+        app.hotwords_presets.add_command(label=topic, command=lambda topic=topic:
+            app.hotwords.set(add_interview_hotwords(app.hotwords.get(), topic)))
+    presets.configure(menu=app.hotwords_presets)
+    presets.pack(side='right', padx=(6, 0))
     app.hotwords_entry = ttk.Entry(field, textvariable=app.hotwords, style='Settings.TEntry')
-    app.hotwords_entry.pack(fill='x')
-    ui.note(audio, '逗号分隔，纠错写法：大模形=大模型').pack(anchor='w', padx=(92, 0), pady=4)
+    app.hotwords_entry.pack(side='left', fill='x', expand=True)
+    app.recognition_help = tk.StringVar()
+    def update_recognition_help(*args):
+        app.recognition_help.set(QWEN_HELP if app.model.get().split()[0] == QWEN_MODEL else
+            '普通词用于识别提示；密等性=幂等性只纠正输出。多个词用逗号分隔。')
+    app.model_label.trace_add('write', update_recognition_help)
+    update_recognition_help()
+    ui.note(audio, variable=app.recognition_help).pack(anchor='w', padx=(92, 0), pady=4)
+
+    ui.section(audio, '手动分段')
+    ui.note(audio, variable=app.manual_cut_status).pack(anchor='w', pady=(2, 4))
+    from manual_cut import MOUSE_OPTIONS
+    field = ui.row(audio, '鼠标快捷键')
+    app.cut_mouse_picker = ui.combo(field, textvariable=app.manual_cut_mouse, values=list(MOUSE_OPTIONS))
+    app.cut_mouse_picker.pack(fill='x')
+    ui.note(audio, variable=app.manual_mouse_status).pack(anchor='w', pady=(2, 4))
+    ui.note(audio, '按下后定稿已采集内容，继续录音并另起一段；双音源一起分段。保存后生效。').pack(anchor='w', pady=(0, 8))
 
     ui.section(audio, '运行状态')
     field = ui.row(audio, 'GPU 加速')
@@ -123,8 +146,18 @@ def build_settings(app, button):
     field = ui.row(ai, '自动答疑')
     app.settings_auto_qa = tk.BooleanVar(value=app.auto_qa.get())
     ttk.Checkbutton(field, text='自动读取转录问题和剪贴板', variable=app.settings_auto_qa).pack(side='left')
+    from qa_worker import QUESTION_SOURCES
+    field = ui.row(ai, '面试官音源')
+    app.question_source = ui.combo(field, values=list(QUESTION_SOURCES))
+    app.question_source.current(0)
+    app.question_source.pack(fill='x')
+    ui.note(ai, '自动时优先系统声音；仅采集麦克风时使用麦克风。另一方的声音仅作上下文。').pack(anchor='w', pady=(2, 6))
     ui.note(ai, variable=app.clipboard_status).pack(anchor='w', pady=(2, 6))
     ui.note(ai, '内容会发送给所选模型服务并按服务商计费；重启后自动答疑关闭。').pack(anchor='w', pady=(0, 12))
+    ui.section(ai, '屏幕提问')
+    ttk.Checkbutton(ai, text='启用 Ctrl+K 截屏提问', variable=app.screen_capture_enabled).pack(anchor='w', pady=5)
+    ui.note(ai, variable=app.screen_capture_status).pack(anchor='w', pady=(2, 4))
+    ui.note(ai, '保存后全局接管 Ctrl+K；按下时截取前台窗口所在屏幕，发送给当前模型。无需开启自动答疑。').pack(anchor='w', pady=(0, 12))
 
     ui.section(appearance, '显示')
     field = ui.row(appearance, '正文字号')
@@ -139,12 +172,14 @@ def build_settings(app, button):
     ui.section(appearance, '屏幕共享')
     ttk.Checkbutton(appearance, text='共享时隐藏闻录窗口', variable=app.capture_hidden).pack(anchor='w', pady=5)
     ui.note(appearance, variable=app.capture_privacy.status).pack(anchor='w', pady=(2, 4))
-    ui.note(appearance, '自己仍可见和操作；保存后生效。共享前请在会议软件的预览中确认。').pack(anchor='w')
+    ui.note(appearance, '自己仍可见和操作；任务栏入口也会隐藏，可从系统托盘打开。保存后生效，请在共享预览中确认。').pack(anchor='w')
 
     app.settings_actions = {}
-    ui.section(tools, '转录记录')
+    ui.section(tools, '练习记录')
     for title, description, action, caption in (
         ('导出记录', '导出当前转录为 TXT / SRT', app.export, '导出'),
+        ('保存问答副本', '保存已完成问答，可重新打开练习', app.save_qa_copy, '保存'),
+        ('打开练习', '查看转录、问答及已保存的修正', app.open_recording, '打开'),
         ('历史记录', '打开本机转录文件夹', lambda: app.open_folder(RECORDINGS), '打开')):
         app.settings_actions[title] = ui.action(tools, title, description, lambda action=action: run(action), caption)
     ui.section(tools, '应用')

@@ -7,6 +7,17 @@ from app import App
 
 
 class HotkeyTests(unittest.TestCase):
+    def test_independent_hotkey_uses_its_own_status_channel(self):
+        events = queue.Queue()
+        hotkey = GlobalHotkey(events, modifiers=7, key=0x7A,
+                              event='screen_hotkey', status_event='screen_hotkey_status')
+        try:
+            hotkey.start()
+            self.assertEqual(events.get(timeout=3), ('screen_hotkey_status', (True, '')))
+        finally:
+            hotkey.close()
+        self.assertFalse(hotkey.thread.is_alive())
+
     def test_native_registration_conflict_and_release(self):
         # Use a separate test combination so the live app's Ctrl+空格 is unaffected.
         first_events, second_events = queue.Queue(), queue.Queue()

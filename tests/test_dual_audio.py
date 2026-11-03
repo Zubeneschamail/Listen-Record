@@ -51,8 +51,8 @@ class DualAudioTests(unittest.TestCase):
 
         def decode(model, assembler, chunk, language, guidance, backlog):
             contexts.append(guidance)
-            self.assertFalse(guidance.history)
-            guidance.history.append('独立上下文')
+            self.assertEqual(guidance.rtf, 0)
+            guidance.rtf = 1
             return [(chunk.start, chunk.start+.1, '我说话' if chunk.audio[0] > .15 else '电脑播放', chunk.epoch)]
 
         api = API()

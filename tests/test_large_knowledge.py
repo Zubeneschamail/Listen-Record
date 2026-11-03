@@ -34,6 +34,9 @@ class LargeKnowledgeTests(unittest.TestCase):
             self.assertEqual(rows, expected.tolist())
             self.assertEqual(rows[0], len(vectors))
             np.testing.assert_allclose([scores[int(i)] for i in expected], (vectors @ query)[expected - 1], atol=1e-6)
+            shortlist = [1, len(vectors) // 2, len(vectors)]
+            shortlisted, _ = semantic_top(connection, query, row_ids=shortlist)
+            self.assertEqual(shortlisted, sorted(shortlist, key=lambda row: -(vectors[row - 1] @ query)))
             calls = 0
             def cancel():
                 nonlocal calls

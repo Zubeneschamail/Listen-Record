@@ -20,7 +20,9 @@ import pyaudiowpatch as pa
 from scipy.signal import resample_poly
 from opencc import OpenCC
 from hotkey import GlobalHotkey
-from qa_worker import QAWorker
+from manual_cut import SideButtonHotkey, MOUSE_OPTIONS
+from screen_capture import ScreenCapture
+from qa_worker import QAWorker, QUESTION_SOURCES
 from qa_connection import QAConnection
 from clipboard_watch import ClipboardWatcher
 from qa_images import ConversationImage
@@ -30,17 +32,19 @@ from qa_provider import APIProvider, PROVIDERS, DEFAULTS, load_settings, image_i
 import theme
 from segmentation import PauseSegmenter, WordAssembler, decode_chunk, DraftPreview
 from paragraphs import ParagraphAssembler
-from recognition import RecognitionContext, save_preferences
+from recognition import (CorrectionUpdates, RecognitionContext, save_preferences,
+                         load_capture_preferences, load_wordlist_snapshot, PreferenceConflictError)
 from scrollbars import SlimScrollbar
 from chat_view import ChatView
 from ui_components import UIControls, SplitterHandle, TitleStatus
 from icon_button import IconToggle
 from settings_view import build_settings
 from audio_levels import AudioLevelNormalizer
-from model_runtime import load_model
+from model_runtime import load_capture_model as load_model, release_model
 from floating_caption import FloatingCaption
 from app_paths import DATA, LOGS, RECORDINGS, preferences, save_desktop
 from version import VERSION
+from recording_storage import append_text
 
 ROOT = Path(__file__).resolve().parent
 NO_AUDIO_DEVICE = "不选择设备"
@@ -62,7 +66,7 @@ def export_text(rows, subtitles=False):
         return "\n\n".join(f"{i}\n{timestamp(r['start'], True)} --> "
                             f"{timestamp(r['end'], True)}\n{r['text']}"
                             for i, r in enumerate(rows, 1)) + "\n"
-    return "\n".join(f"[{row_time(r)}] {r['text']}" for r in rows) + "\n"
+    return "\n".join(f"[{row_time(r)}{' · 转录中断' if r.get('incomplete') is True else ''}] {r['text']}" for r in rows) + "\n"
 
 
 def row_time(row):
@@ -80,8 +84,47 @@ def make_segment(start, end, text, captured_epoch):
             "captured_at": datetime.fromtimestamp(captured_epoch).astimezone().isoformat(timespec="milliseconds")}
 
 
+def save_segment(path, row):
+    """Append confirmed text without rewriting an ever-growing recording.
+
+    JSONL is written first so the structured original survives a TXT failure.
+    Recoverable append errors roll back that file's unfinished tail.
+    """
+    append_text(path, json.dumps(row, ensure_ascii=False) + '\n')
+    append_text(path.with_suffix('.txt'), export_text([row]), bom=True)
+
+
+def save_transcript_export(path, rows, *, source_paths=()):
+    """Replace a finished TXT/SRT export, preserving any earlier file on failure."""
+    import tempfile
+    path = Path(path).resolve()
+    if path in {Path(source).resolve() for source in source_paths}:
+        raise ValueError('请选择另一个文件名导出，原练习记录将保留。')
+    suffix = path.suffix.casefold()
+    if suffix not in ('.txt', '.srt'):
+        raise ValueError('请使用 .txt 或 .srt 扩展名导出，练习记录请保留为原文件。')
+    text = export_text(rows, suffix == '.srt')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8-sig', dir=path.parent,
+                                         prefix=path.name+'.', suffix='.tmp', delete=False) as file:
+            temporary = Path(file.name)
+            file.write(text)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def mono_16k(audio, rate):
     mono = audio.mean(axis=1) if audio.ndim == 2 else audio
+    if audio.ndim == 2 and audio.shape[0] and audio.shape[1] > 1:
+        # Some stereo devices invert one channel. Averaging then erases speech;
+        # retain the strongest channel only when the mix shows severe cancellation.
+        power = np.mean(audio.astype(np.float64) ** 2, axis=0)
+        strongest = int(np.argmax(power))
+        if np.mean(mono.astype(np.float64) ** 2) < power[strongest] * .0625:
+            mono = audio[:, strongest]
     divisor = math.gcd(int(rate), 16000)
     return resample_poly(mono, 16000 // divisor, int(rate) // divisor).astype(np.float32)
 
@@ -92,11 +135,24 @@ def clean_caption(text):
     return SIMPLIFIED.convert(text) if re.search(r"[\w\u4e00-\u9fff]", text) else ""
 
 
+def create_segmenter(model_name):
+    from qwen_engine import QWEN_MODEL
+    if model_name == QWEN_MODEL:
+        return PauseSegmenter(short_speech_pause=1.2)
+    return PauseSegmenter()
+
+
 class Transcriber:
     def __init__(self, events):
         self.events = events
         self.stop_event = threading.Event()
         self.context_reset = threading.Event()
+        self.cut_active = threading.Event()
+        self.cut_lock = threading.Lock()
+        self.capture_queue = None
+        self.cut_pending = False
+        self.cut_marker = object()
+        self.correction_updates = CorrectionUpdates()
         self.thread = None
         self.model = None
         self.model_name = None
@@ -107,14 +163,103 @@ class Transcriber:
     def start(self, device, model, language, hotwords="", echo_cancellation=False):
         self.stop_event.clear()
         self.context_reset.clear()
+        self.correction_updates.reset()
         self.thread = threading.Thread(target=self.run, args=(device, model, language, hotwords, echo_cancellation), daemon=True)
         self.thread.start()
 
     def stop(self):
+        self.cut_active.clear()
         self.stop_event.set()
+
+    def request_cut(self):
+        """Insert one FIFO boundary behind already queued audio, without dropping it."""
+        with self.cut_lock:
+            if self.capture_queue is None or self.stop_event.is_set() or self.cut_pending:
+                return False
+            try:
+                self.capture_queue.put_nowait(self.cut_marker)
+            except queue.Full:
+                return False
+            self.cut_pending = True
+            return True
+
+    def _manual_boundary(self, states, transcribe, paragraphs, notify_voice):
+        self._finish_sources(states, transcribe, paragraphs)
+        for source, state in states.items():
+            for start, end, text, epoch in state['assembler'].finish():
+                text = clean_caption(state['guidance'].normalize(text))
+                if text:
+                    row = make_segment(start, end, text, epoch)
+                    row['source'] = source
+                    for paragraph in paragraphs.consume(row):
+                        self.emit('segment', paragraph)
+            state['preview'].defer()
+        for paragraph in paragraphs.finish():
+            self.emit('segment', paragraph)
+        for source in states:
+            self.emit('preview', {'source': source, 'text': ''})
+            notify_voice(source, False)
+        with self.cut_lock:
+            self.cut_pending = False
+        self.emit('manual_cut_done', None)
+
+
+    def unload_model(self):
+        model, self.model = self.model, None
+        self.model_name = None
+        release_model(model)
 
     def reset_context(self):
         self.context_reset.set()
+
+    def update_corrections(self, hotwords):
+        self.correction_updates.publish(hotwords)
+
+    def _finish_idle_sources(self, states, transcribe, paragraphs, notify_voice, current_source=None, *, incomplete=False):
+        """Finish a quiet device even while the other device sends callbacks.
+
+        Call only after the shared capture queue drains: an unprocessed block
+        could still continue the utterance. Decode before publishing voice idle
+        so automatic Q&A always sees the final transcript first.
+        """
+        if incomplete and paragraphs.pending:
+            paragraphs.pending['incomplete'] = True
+        for source, state in states.items():
+            if source == current_source:
+                continue
+            if time.monotonic() - state['received'] > .7:
+                if incomplete:
+                    transcribe(source, state['segmenter'].finish(), incomplete=True)
+                else:
+                    transcribe(source, state['segmenter'].finish())
+            if time.monotonic() - state['received'] >= paragraphs.pause:
+                if paragraphs.pending and paragraphs.pending['source'] == source:
+                    for paragraph in paragraphs.finish():
+                        self.emit('segment', paragraph)
+                notify_voice(source, False)
+
+    def _finish_pending_words(self, states, paragraphs):
+        """Retain recognized stable words even if decoding the next tail failed."""
+        for source, state in states.items():
+            try:
+                for start, end, text, epoch in state['assembler'].finish():
+                    text = clean_caption(state['guidance'].normalize(text))
+                    if text:
+                        row = make_segment(start, end, text, epoch)
+                        row['source'] = source
+                        row['incomplete'] = True
+                        for paragraph in paragraphs.consume(row):
+                            self.emit('segment', paragraph)
+            except Exception as exc:
+                # One source must not prevent the other source or device cleanup.
+                logging.exception('Retaining recognized words during capture cleanup')
+                self.emit('error', '保留已识别文字失败：' + str(exc))
+
+    def _finish_sources(self, states, transcribe, paragraphs, *, incomplete=False):
+        if incomplete and paragraphs.pending:
+            paragraphs.pending['incomplete'] = True
+        for source, state in states.items():
+            transcribe(source, state['segmenter'].finish(), incomplete=incomplete)
 
     def run(self, device, model_name, language, hotwords="", echo_cancellation=False):
         from echo_cancellation import capture_offset
@@ -125,18 +270,11 @@ class Transcriber:
         overflow = threading.Event()
         origin = 0.0
         paragraphs = ParagraphAssembler()
+        capture_failed = False
         try:
-            self.emit("status", "正在加载本地模型…")
-            if self.model_name != model_name:
-                self.model = None
-                self.model_name = None
-                self.model = load_model(model_name, status=lambda text: self.emit('status', text))
-                self.model_name = model_name
             if self.stop_event.is_set():
                 return
             self.emit('status', '正在连接音频设备…')
-            backend = getattr(getattr(self.model, 'model', None), 'device', 'cpu')
-            self.emit('recognition_backend', (model_name, backend))
             audio_api = pa.PyAudio()
             devices = device if isinstance(device, list) else [{"index": device}]
             if not devices:
@@ -147,9 +285,10 @@ class Transcriber:
                 if not info.get("maxInputChannels"):
                     raise RuntimeError("所选设备不支持输入，请刷新后重新选择。")
                 rate, channels = int(info["defaultSampleRate"]), int(info["maxInputChannels"])
-                state = {"rate": rate, "segmenter": PauseSegmenter(), "assembler": WordAssembler(),
-                         "levels": AudioLevelNormalizer(),
-                         "preview": DraftPreview(), "guidance": RecognitionContext(hotwords),
+                state = {"rate": rate, "segmenter": create_segmenter(model_name), "assembler": WordAssembler(),
+                         "levels": AudioLevelNormalizer(max_gain=4. if source == 'microphone' else 64.),
+                         "preview": DraftPreview(), "guidance": RecognitionContext(
+                             hotwords, correction_source=self.correction_updates.snapshot),
                          "received": time.monotonic()}
                 states[source] = state
 
@@ -184,16 +323,39 @@ class Transcriber:
                                    {source: state['rate'] for source, state in states.items()}, mono_16k)
                 echo.start()
             origin = time.monotonic()
+            with self.cut_lock:
+                self.capture_queue = chunks
+                self.cut_pending = False
+                self.cut_active.set()
             for stream in streams:
                 stream.start_stream()
+            # Open capture before slow model loading so the opening question is
+            # retained in the existing bounded queue. A Stop during loading still
+            # drains captured speech once the model is ready.
+            if self.model_name != model_name or self.model is None or getattr(self.model, 'closed', False) is True:
+                if self.stop_event.is_set() and chunks.empty() and (not echo or echo.done.is_set()):
+                    return
+                self.emit('capture_loading', model_name)
+                self.emit('status', '已开始采集，正在加载本地模型（音频暂存中）…')
+                self.unload_model()
+                self.model = load_model(model_name, status=lambda text: self.emit('status', text))
+                self.model_name = model_name
             backend = getattr(getattr(self.model, "model", None), "device", "cpu")
+            self.emit('recognition_backend', (model_name, backend))
             source_names = " + ".join("系统声音" if x == "system" else "麦克风" for x in states)
             self.emit("status", f"正在转写 · {'GPU' if backend == 'cuda' else 'CPU'} · {source_names}"
                       + (' · 回声消除已开启' if echo else ''))
 
-            def transcribe(source, ready):
+            def notify_voice(source, active):
+                active = bool(active)
+                if states[source].get('voice_active') != active:
+                    states[source]['voice_active'] = active
+                    self.emit('voice_activity', {'source': source, 'active': active})
+
+            def transcribe(source, ready, *, incomplete=False):
                 state = states[source]
                 for chunk in ready:
+                    notify_voice(source, True)
                     for start, end, text, epoch in decode_chunk(
                             self.model, state["assembler"], chunk, language, state["guidance"],
                             chunks.qsize() / (10 * len(states))):
@@ -201,6 +363,8 @@ class Transcriber:
                         if text:
                             row = make_segment(start, end, text, epoch)
                             row["source"] = source
+                            if incomplete:
+                                row['incomplete'] = True
                             for paragraph in paragraphs.consume(row):
                                 self.emit("segment", paragraph)
                     pending = state["assembler"].pending
@@ -210,19 +374,17 @@ class Transcriber:
             while not self.stop_event.is_set() or (echo and not echo.done.is_set()) or not chunks.empty():
                 if self.context_reset.is_set():
                     paragraphs.pending = None
-                    for state in states.values():
-                        state["guidance"].history.clear()
-                        state["guidance"].last_end = None
                     self.context_reset.clear()
                 try:
-                    source, offset, samples, block_epoch = chunks.get(timeout=0.1)
+                    item = chunks.get(timeout=0.1)
+                    if item is self.cut_marker:
+                        self._manual_boundary(states, transcribe, paragraphs, notify_voice)
+                        continue
+                    source, offset, samples, block_epoch = item
                 except queue.Empty:
+                    self._finish_idle_sources(states, transcribe, paragraphs, notify_voice,
+                        incomplete=overflow.is_set() or bool(echo and echo.error))
                     for source, state in states.items():
-                        if time.monotonic() - state["received"] > 0.7:
-                            transcribe(source, state["segmenter"].finish())
-                        if time.monotonic() - state["received"] >= paragraphs.pause and paragraphs.pending and paragraphs.pending['source'] == source:
-                            for paragraph in paragraphs.finish():
-                                self.emit('segment', paragraph)
                         if not self.stop_event.is_set() and not state["stream"].is_active():
                             raise RuntimeError("音频设备已断开或停止响应，请刷新设备后重试。")
                     continue
@@ -238,14 +400,19 @@ class Transcriber:
                 for paragraph in paragraphs.silence(source, offset + len(audio)/16000,
                         getattr(state['segmenter'], 'last_speech_end', None)):
                     self.emit('segment', paragraph)
-                if paragraphs.pending and chunks.empty():
-                    owner = paragraphs.pending['source']
-                    if owner != source and time.monotonic()-states[owner]['received'] >= paragraphs.pause:
-                        # Loopback can stop delivering samples while the mic keeps
-                        # delivering silence, so the queue-empty handler never runs.
-                        transcribe(owner, states[owner]['segmenter'].finish())
-                        for paragraph in paragraphs.finish():
-                            self.emit('segment', paragraph)
+                if chunks.empty():
+                    # The quiet source may have only undecoded audio or a held
+                    # hard-cut phrase, with no ParagraphAssembler row yet.
+                    self._finish_idle_sources(states, transcribe, paragraphs, notify_voice, source,
+                        incomplete=overflow.is_set() or bool(echo and echo.error))
+                # Publish idle only after all final words/paragraphs have entered
+                # the event queue, so Q&A cannot race the last transcript part.
+                speech_end = getattr(state['segmenter'], 'last_speech_end', None)
+                pending_text = (getattr(state['segmenter'], 'pending_speech', False) or
+                                state['assembler'].pending or
+                                (paragraphs.pending and paragraphs.pending['source'] == source))
+                notify_voice(source, pending_text or (speech_end is not None and
+                             offset + len(audio)/16000 - speech_end < paragraphs.pause))
                 backlog = chunks.qsize() / (10 * len(states))
                 self.emit("backlog", backlog)
                 try:
@@ -257,16 +424,27 @@ class Transcriber:
                     draft = None
                 if draft is not None and not self.stop_event.is_set():
                     self.emit("preview", {"source": source, "text": paragraphs.preview(source, clean_caption(draft))})
-            for source, state in states.items():
-                transcribe(source, state["segmenter"].finish())
+            # A known capture loss applies to every unfinished source tail.
+            # Mark before finishing: switching source can emit the previous
+            # paragraph before the error reaches the exception handler.
+            capture_failed = overflow.is_set() or bool(echo and echo.error)
+            self._finish_sources(states, transcribe, paragraphs, incomplete=capture_failed)
             if overflow.is_set():
                 raise RuntimeError("音频缓冲溢出或采集不连续，已停止以避免静默丢字。请选更快的模型后重试。")
             if echo and echo.error:
                 raise RuntimeError(echo.error)
         except Exception as exc:
+            capture_failed = True
             logging.exception("Transcription failed")
             self.emit("error", str(exc))
         finally:
+            self.cut_active.clear()
+            with self.cut_lock:
+                self.capture_queue = None
+                self.cut_pending = False
+            if capture_failed and paragraphs.pending:
+                paragraphs.pending['incomplete'] = True
+            self._finish_pending_words(states, paragraphs)
             for paragraph in paragraphs.finish():
                 self.emit('segment', paragraph)
             self.stop_event.set()
@@ -300,8 +478,11 @@ class App:
         self.startup_pending_issues = []
         self.startup_advance_on_hide = False
         self.qa = QAWorker(self.events)
+        self.recording_sources = set()
+        self.committed_question_source = 'auto'
         self.qa.track_usage = True
         self.qa.context_provider = self.session_context_snapshot
+        self.qa.voice_context_provider = lambda boundary: self.session_context_snapshot(source='auto', row_limit=boundary)
         self.qa_connection = QAConnection(self.events)
         self.qa_settings = load_settings()
         from qa_balance import BalanceQuery
@@ -329,7 +510,25 @@ class App:
         self.clipboard_watcher = ClipboardWatcher(self.events)
         self.clipboard_pending = deque()
         self.clipboard_request_generation = None
+        self.screen_capture_enabled = tk.BooleanVar(value=preferences().get('screen_capture_hotkey', True))
+        self.screen_capture_status = tk.StringVar(value='Ctrl+K 屏幕提问准备中…')
+        self.screen_capture = ScreenCapture(self.events)
+        self.screen_hotkey = None
+        mouse_choice = preferences().get('manual_cut_mouse', '侧键 1（后退）')
+        self.manual_cut_mouse = tk.StringVar(value=mouse_choice if mouse_choice in MOUSE_OPTIONS else '关闭')
+        self.manual_cut_status = tk.StringVar(value='Ctrl+Shift+空格：手动分段')
+        self.manual_mouse_status = tk.StringVar(value='侧键只在转录期间生效')
+        self.cut_hotkey = GlobalHotkey(self.events, modifiers=0x0006, key=0x20,
+            event='manual_cut', status_event='manual_cut_status')
+        self.cut_mouse = None
+        self.screen_pending_item = None
         self.qa_history = []
+        self.qa_turn_ids = {}
+        self.qa_history_ids = {}
+        self.qa_origins = {}
+        self.qa_times = {}
+        self.qa_journal_path = None
+        self.qa_unreadable_paths = set()
         self.qa_image_contexts = {}
         self.qa_pending_image_context = None
         self.qa_display_history = []
@@ -342,12 +541,16 @@ class App:
         self.qa_status = tk.StringVar(value="等待声源中的问题…")
         self.rows = []
         self.session_rows = []
+        self.row_origins = {}
+        self.corrected_rows = set()
+        self.transcript_editor = None
         self.devices = []
         self.input_devices = []
         self.drafts = {}
         self.bubble_selection = None
         self.busy = False
         self.failed = False
+        self.session_save_failed = False
         self.closing = False
         self.hotkey = GlobalHotkey(self.events)
         self.session = None
@@ -476,7 +679,7 @@ class App:
         # Indexed document backs excerpt selection and legacy saved transcripts.
         # The visible surface renders source-labelled selectable chat bubbles.
         self.chat = ChatView(self.left_panel, self.bubble_click, self.bubble_select_text,
-                             overlay_parent=self.columns)
+                             overlay_parent=self.columns, edit=self.open_transcript_editor)
         self.chat.pack(fill="both", expand=True)
         self.copy_button.place(relx=1, x=-14, y=3, anchor="ne")
         self.copy_button.lift()
@@ -557,12 +760,14 @@ class App:
         root.bind('<Escape>', self.exit_focus_mode)
         for widget in (root, self.text, self.qa_text):
             widget.bind("<Control-BackSpace>", self.clear_conversation)
-        root.after(100, self.enable_taskbar)
+        root.after(100, self.sync_taskbar)
         root.bind("<Map>", self.on_main_window_mapped, add="+")
         root.bind('<FocusIn>', self.raise_settings, add='+')
         root.after(200, self.start_tray)
         root.after(100, self.poll)
         self.hotkey.start()
+        self.cut_hotkey.start()
+        self.apply_screen_hotkey()
 
     def resize_composer(self, expanded):
         height = self.composer.expanded_height if expanded else 40
@@ -587,9 +792,12 @@ class App:
         self.gpu_check_button.configure(state='disabled')
         self.startup_checks = StartupChecks()
         self.startup_overlay = StartupOverlay(self)
-        profile = dict(DEFAULTS['deepseek'], **self.qa_settings['profiles'].get('deepseek', {}))
-        profile['base_url'] = DEFAULTS['deepseek']['base_url']
-        self.startup_checks.start(self.model.get().split()[0], profile)
+        self.startup_provider = self.qa_settings['provider']
+        profile = dict(DEFAULTS[self.startup_provider],
+                       **self.qa_settings['profiles'].get(self.startup_provider, {}))
+        if self.startup_provider == 'deepseek':
+            profile['base_url'] = DEFAULTS['deepseek']['base_url']
+        self.startup_checks.start(self.model.get().split()[0], profile, self.startup_provider)
 
     def finish_startup_checks(self):
         self.startup_results = dict(self.startup_checks.results)
@@ -602,8 +810,8 @@ class App:
         self.gpu_check_status.set('GPU 检测通过' if state == 'success' else 'GPU 未通过')
         self.gpu_detection_state.set(state)
         self.gpu_check_detail.set(detail)
-        if self.qa_settings['provider'] == 'deepseek':
-            state, detail = self.startup_results['deepseek']
+        if self.qa_settings['provider'] == self.startup_provider:
+            state, detail = self.startup_results['qa']
             self.qa_connection.record(None if state == 'success' else detail)
         issues = [key for key, (state, _) in self.startup_results.items() if state == 'error']
         self.startup_pending_issues = issues
@@ -616,16 +824,20 @@ class App:
         self.open_startup_issue(self.startup_pending_issues.pop(0), advance=True)
 
     def open_startup_issue(self, key, advance=False):
+        if key == 'qa' and self.qa_settings['provider'] != self.startup_provider:
+            if advance:
+                self.root.after_idle(self.advance_startup_issue)
+            return
         self.toggle_settings()
-        page = self.settings_pages['ai' if key == 'deepseek' else 'audio']
+        page = self.settings_pages['ai' if key == 'qa' else 'audio']
         self.settings_tabs.select(page)
         page.canvas.yview_moveto(0)
         if key == 'model':
             from desktop_dialogs import model_manager
             model_manager(self, on_close=self.advance_startup_issue if advance else None)
-        elif key == 'deepseek':
+        elif key == 'qa':
             from qa_settings_dialog import show
-            show(self, initial_provider='deepseek', on_close=self.advance_startup_issue if advance else None,
+            show(self, initial_provider=self.startup_provider, on_close=self.advance_startup_issue if advance else None,
                  initial_error=self.startup_results[key][1])
         else:
             self.startup_advance_on_hide = advance
@@ -699,19 +911,40 @@ class App:
     def load_desktop_settings(self):
         values = preferences()
         for key, widget in (("model", self.model), ("language", self.language),
-                            ("mode", self.mode), ("output", self.device), ("input", self.microphone)):
+                            ("mode", self.mode), ("output", self.device), ("input", self.microphone),
+                            ("question_source", self.question_source)):
             if values.get(key) in widget['values']:
                 widget.set(values[key])
+        self.apply_question_source()
 
-    def save_desktop_settings(self, force=False, raise_errors=False):
+    def apply_question_source(self):
+        self.committed_question_source = QUESTION_SOURCES.get(self.question_source.get(), 'auto')
+        self.update_question_source()
+
+    def update_question_source(self):
+        source = self.committed_question_source
+        if source == 'auto':
+            source = 'microphone' if self.recording_sources == {'microphone'} else 'system'
+        generation = self.qa.generation
+        self.qa.set_question_source(source)
+        if self.qa.generation != generation:
+            self.qa_status.set('面试官音源已更新，等待新问题…')
+
+    def save_desktop_settings(self, force=False, raise_errors=False, *, save_recognition=True):
         if self.settings_visible and not force:
             return
         try:
-            save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
+            # Closing or adjusting the window must not overwrite a word list
+            # changed since it was loaded. Only an explicit settings save commits it.
+            if force and save_recognition:
+                save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
             save_desktop(dict(model=self.model.get(), language=self.language.get(), mode=self.mode.get(),
                               output=self.device.get(), input=self.microphone.get(), dark_mode=self.dark_mode.get(),
                               font_size=self.font_size.get(), capture_hidden=self.capture_privacy.enabled,
-                              echo_cancellation=self.echo_cancellation.get()))
+                              echo_cancellation=self.echo_cancellation.get(),
+                              question_source=self.question_source.get(),
+                              screen_capture_hotkey=self.screen_capture_enabled.get(),
+                              manual_cut_mouse=self.manual_cut_mouse.get()))
         except OSError:
             logging.exception('Saving desktop settings')
             if raise_errors:
@@ -839,12 +1072,13 @@ class App:
 
     def on_main_window_mapped(self, event):
         if event.widget is self.root:
-            self.root.after_idle(self.enable_taskbar)
+            self.root.after_idle(self.sync_taskbar)
 
-    def enable_taskbar(self, window=None):
-        from window_effects import apply_shadow
-        apply_shadow(window or self.root)
-        # Keep a taskbar entry even though Tk's native window decorations are hidden.
+    def sync_taskbar(self):
+        from window_effects import apply_shadow, set_taskbar_tab
+        apply_shadow(self.root)
+        # Tk's borderless wrapper needs an explicit taskbar style. When capture
+        # exclusion is enabled, remove its taskbar/Alt-Tab entry as well.
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -852,21 +1086,21 @@ class App:
         user32.GetParent.restype = wintypes.HWND
         user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
-        hwnd = user32.GetParent((window or self.root).winfo_id())
+        hwnd = user32.GetParent(self.root.winfo_id())
         style = user32.GetWindowLongW(hwnd, -20)
-        desired = (style | 0x00040000) & ~0x00000080
+        if self.capture_privacy.enabled:
+            desired = (style | 0x00000080) & ~0x00040000  # WS_EX_TOOLWINDOW
+        else:
+            desired = (style | 0x00040000) & ~0x00000080  # WS_EX_APPWINDOW
         if style == desired:
             return
-        # Explorer only re-evaluates a visible window's taskbar eligibility when
-        # it is shown again. Changing the extended style alone is insufficient.
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.IsWindowVisible.argtypes = [wintypes.HWND]
-        visible = user32.IsWindowVisible(hwnd)
-        if visible:
-            user32.ShowWindow(hwnd, 0)
         user32.SetWindowLongW(hwnd, -20, desired)
-        if visible:
-            user32.ShowWindow(hwnd, 5)
+        # Refresh the native frame without hiding the Tk window: ShowWindow
+        # here re-enters Tcl while a settings callback is running.
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x37)  # FRAMECHANGED, no move/size/activate
+        set_taskbar_tab(hwnd, visible=not self.capture_privacy.enabled)
 
     def minimize(self):
         self.hide_to_tray()
@@ -911,8 +1145,17 @@ class App:
         if self.settings_visible:
             self.raise_settings()
             return
+        recognition_revision, recognition_readable = None, True
+        try:
+            hotwords, recognition_revision = load_wordlist_snapshot(DATA / 'recognition-settings.json')
+            self.hotwords.set(hotwords)
+        except (OSError, ValueError) as exc:
+            recognition_revision = getattr(exc, 'revision', None)
+            recognition_readable = hasattr(exc, 'revision')
+            self.status.set('词库未能读取，可在热词 / 纠错中修改后保存：'+str(exc))
         from settings_session import SettingsSession
-        self.settings_session = SettingsSession(self)
+        self.settings_session = SettingsSession(self, recognition_revision=recognition_revision,
+                                                recognition_readable=recognition_readable)
         self.settings_visible = True
         self.settings_button.configure(bg=self.theme_color("#E6F2FB"), fg=self.theme_color("#737b8c"))
         window = self.settings_window
@@ -940,14 +1183,30 @@ class App:
         except CapturePrivacyError as exc:
             messagebox.showerror('共享隐藏未生效', str(exc), parent=self.settings_window)
             return
+        except PreferenceConflictError as exc:
+            messagebox.showerror('词库未保存', str(exc), parent=self.settings_window)
+            return
         except OSError:
             messagebox.showerror('保存失败', '设置未保存，请检查磁盘空间或写入权限后重试。', parent=self.settings_window)
             return
         self.hide_settings(discard=False)
+        self.sync_taskbar()
 
     def hide_settings(self, event=None, discard=True, restore_preview=True):
         if not self.settings_visible:
             return 'break'
+        if event is not None:
+            try:
+                grabbed = self.root.grab_current()
+            except (tk.TclError, KeyError):
+                # Tcl-only combobox/messagebox grabs must finish before their owner.
+                return 'break'
+            if grabbed is not None and grabbed.winfo_toplevel() is not self.settings_window:
+                child = grabbed.winfo_toplevel()
+                if child is not self.root and child.bind('<Escape>'):
+                    child.focus_set()
+                    child.event_generate('<Escape>', when='tail')
+                return 'break'
         if discard:
             self.settings_session.restore(preview=restore_preview)
         self.settings_session = None
@@ -965,7 +1224,7 @@ class App:
         self.pinned = not self.pinned
         self.root.attributes("-topmost", self.pinned)
         self.raise_settings()
-        self.root.after_idle(self.enable_taskbar)
+        self.root.after_idle(self.sync_taskbar)
         self.pin_button.configure(text="取消置顶" if self.pinned else "置顶窗口")
 
     def toggle_recording(self):
@@ -1026,6 +1285,7 @@ class App:
         if self.busy:
             self.gpu_check_detail.set('请先停止转写再检测，避免测试推理影响正在进行的识别。')
             return
+        self.engine.unload_model()
         self.gpu_check_button.configure(state='disabled')
         self.gpu_check_status.set('检测中…')
         self.gpu_detection_state.set('checking')
@@ -1051,22 +1311,26 @@ class App:
             self.toggle_settings()
             return
         try:
-            save_preferences(DATA / "recognition-settings.json", self.hotwords.get())
-        except OSError as exc:
-            messagebox.showerror("无法保存热词", str(exc))
+            hotwords = load_capture_preferences(DATA / 'recognition-settings.json')
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('无法读取热词 / 纠错', str(exc), parent=self.root)
             return
+        self.hotwords.set(hotwords)
         # Recording files have separate time origins; the visible conversation
         # and AI state persist across stop/start until explicitly cleared.
         try:
             folder = RECORDINGS
             folder.mkdir(exist_ok=True)
-            self.session = folder / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".jsonl")
-            self.session.touch()
+            session = folder / (datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".jsonl")
+            session.touch()
+            self.session = session
         except OSError as exc:
             messagebox.showerror("无法保存记录", str(exc))
             return
         self.session_rows = []
         self.failed = False
+        self.session_save_failed = False
+        self.qa_journal_path = None
         if self.gpu_check.active:
             self.gpu_check.close()
             self.gpu_check_status.set('已取消')
@@ -1074,11 +1338,15 @@ class App:
             self.gpu_check_detail.set('已开始转写，GPU 检测已取消。')
             self.gpu_check_button.configure(state='normal')
         self.gpu_runtime_status.set('当前转写：正在加载模型…')
+        self.recording_sources = {selected_device['source'] for selected_device in selected}
+        self.qa.voice_activity.clear()
+        self.update_question_source()
         self.set_busy(True)
+        self.apply_manual_cut_mouse()
         self.engine.start(selected,
                           self.model.get().split()[0],
                           {"中文": "zh", "英语": "en", "自动检测": None}[self.language.get()],
-                          self.hotwords.get(), echo_cancellation=self.echo_cancellation.get())
+                          hotwords, echo_cancellation=self.echo_cancellation.get())
 
     def stop(self):
         self.engine.stop()
@@ -1086,6 +1354,10 @@ class App:
         self.status.set("正在处理剩余音频…")
 
     def clear(self, preserve_recording=False):
+        if self.transcript_editor is not None:
+            self.transcript_editor.destroy()
+        self.screen_capture.cancel()
+        self.screen_pending_item = None
         self.knowledge_history_start = self.knowledge_rows_start = 0
         self.cancel_question_edit()
         self.context_meter.set_usage()
@@ -1096,6 +1368,11 @@ class App:
             self.clipboard_watcher.start()
         self.qa.reset()
         self.qa_history.clear()
+        self.qa_turn_ids.clear()
+        self.qa_history_ids.clear()
+        self.qa_origins.clear()
+        self.qa_times.clear()
+        self.qa_replacement = None
         self.qa_image_contexts.clear()
         self.qa_pending_image_context = None
         self.qa_display_history.clear()
@@ -1108,10 +1385,14 @@ class App:
         self.qa_status.set("")
         self.render_qa()
         self.rows = []
+        self.row_origins.clear()
+        self.corrected_rows.clear()
         self.chat.clear()
         self.bubble_selection = None
         if not preserve_recording:
             self.session_rows = []
+            self.session_save_failed = False
+            self.qa_journal_path = None
         self.last_caption = ""
         self.show_preview("")
         self.text.configure(state="normal")
@@ -1125,7 +1406,7 @@ class App:
             return "break"
         self.clear(preserve_recording=True)
         self.engine.reset_context()
-        self.footer.set(f"已保存 {len(self.session_rows)} 段")
+        self.footer.set('问答练习 · 已保存记录保留' if self.qa_journal_path else f"已保存 {len(self.session_rows)} 段")
         if not self.busy:
             self.status.set("当前对话已清空 · 记录已保留")
         return "break"
@@ -1137,27 +1418,198 @@ class App:
         self.root.after(1500, lambda: self.copy_button.configure(text="复制全文"))
 
     def restore_session(self, path):
-        """Restore the stopped view during an update; never resubmit or rewrite rows."""
+        """Restore a recording or standalone Q&A without resubmitting old turns."""
+        from transcript_corrections import load_recording
         path = Path(path)
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        for row in rows:
-            if not isinstance(row.get("text"), str):
-                raise ValueError("记录格式不正确")
-            row_time(row)
+        if path.name.lower().endswith('.qa.jsonl'):
+            from qa_records import load_qa
+            if not path.is_file():
+                raise FileNotFoundError('找不到问答记录，请重新选择文件。')
+            answers = load_qa(path)  # Validate before replacing the current view.
+            self.clear()
+            self.session = None
+            self.qa_journal_path = path
+            self.qa_unreadable_paths.discard(path.resolve())
+            self.restore_qa_records(answers)
+            self.status.set('已打开问答练习 · 新回答将继续保存')
+            self.footer.set(f'已载入 {len(answers)} 条问答 · 无转录')
+            return
+        document = load_recording(path)
+        rows = document.rows
+        from qa_records import load_qa
+        qa_warning = ''
+        try:
+            answers = load_qa(path.with_suffix('.qa.jsonl'))
+            self.qa_unreadable_paths.discard(path.with_suffix('.qa.jsonl').resolve())
+        except (OSError, ValueError, UnicodeError) as exc:
+            answers = []
+            self.qa_unreadable_paths.add(path.with_suffix('.qa.jsonl').resolve())
+            qa_warning = '历史问答未载入：'+str(exc)
         self.clear()
         self.session = path
         self.rows = rows
         self.session_rows = list(rows)
+        self.row_origins = dict(enumerate(document.origins))
+        self.corrected_rows = document.corrected
         for i, row in enumerate(rows):
             self.append_row(i, row)
+        self.restore_qa_records(answers)
+        if qa_warning:
+            self.qa_status.set(qa_warning)
         self.last_caption = rows[-1]["text"] if rows else ""
-        self.status.set(f"已停止 · {len(rows)} 段已保存")
+        warnings = list(document.warnings) + ([qa_warning] if qa_warning else [])
+        self.status.set((f"已停止 · {len(rows)} 段已保存" if not warnings else
+                         '已打开记录 · '+warnings[0]))
         self.footer.set(f"已保存 {len(rows)} 段")
+
+    def restore_qa_records(self, answers):
+        if not answers:
+            return
+        self.qa_history = [(record.question, record.answer) for record in answers]
+        self.qa_display_history = self.qa_history[:-1]
+        self.qa_question, self.qa_answer = self.qa_history[-1]
+        for index, record in enumerate(answers):
+            self.qa_turn_ids[index] = self.qa_history_ids[index] = record.key
+            self.qa_origins[record.key] = record.origin
+            self.qa_times[record.key] = record.time
+        self.open_qa()
+        self.render_qa()
+        self.qa_status.set(f'已载入 {len(answers)} 条历史问答 · 未发送新请求')
+
+    def save_qa_copy(self):
+        import uuid
+        from qa_records import save_qa_copy
+        records = []
+        for index, (question, answer) in enumerate(self.qa_history):
+            if question.strip() and answer.strip():
+                key = self.qa_history_ids.get(index) or uuid.uuid4().hex
+                records.append(dict(id=key, time=self.qa_times.get(key, ''), question=question, answer=answer))
+        if not records:
+            self.qa_status.set('尚无已完成问答可保存，请等待回答完成。')
+            return
+        # Windows applies one final suffix; a compound default duplicates .qa.jsonl.
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension='.jsonl',
+            initialfile=datetime.now().strftime('闻录问答-%Y%m%d-%H%M%S.qa.jsonl'),
+            filetypes=[('问答记录（.qa.jsonl）', '*.jsonl')], title='保存问答副本')
+        if not path:
+            return
+        try:
+            target = Path(path).resolve()
+            if not target.name.lower().endswith('.qa.jsonl'):
+                raise ValueError('请使用 .qa.jsonl 扩展名，以便重新打开练习。')
+            sources = {origin.path.resolve() for origin in self.qa_origins.values()}
+            sources.update(origin.path.resolve() for origin in self.row_origins.values())
+            sources.update(self.qa_unreadable_paths)
+            if self.session:
+                sources.update((self.session.resolve(), self.session.with_suffix('.qa.jsonl').resolve()))
+            if self.qa_journal_path:
+                sources.add(self.qa_journal_path.resolve())
+            if target in sources:
+                raise ValueError('请选择另一个文件名保存副本，原练习记录将保留。')
+            save_qa_copy(target, records)
+        except (OSError, ValueError, UnicodeError) as exc:
+            self.qa_status.set('问答副本未保存：'+str(exc))
+            return
+        self.qa_status.set(f'已保存 {len(records)} 条已完成问答的副本 · 打开该文件可继续练习')
+
+    def open_recording(self):
+        if self.busy:
+            self.status.set('请先停止转写，再打开历史记录。')
+            return
+        path = filedialog.askopenfilename(parent=self.root, initialdir=RECORDINGS,
+            title='打开练习记录', filetypes=[('转录 / 问答记录', '*.jsonl')])
+        if path:
+            try:
+                self.restore_session(path)
+            except (OSError, ValueError, TypeError) as exc:
+                messagebox.showerror('无法打开记录', str(exc), parent=self.root)
+
+    def open_transcript_editor(self, row_id):
+        if self.transcript_editor is not None:
+            self.transcript_editor.lift()
+            return
+        if self.closing or self.root.grab_current():
+            return
+        origin = self.row_origins.get(row_id)
+        if origin is None:
+            self.status.set('这段原转录尚未成功保存，请先导出当前文字。')
+            return
+        from transcript_corrections import original_row
+        from transcript_editor import TranscriptEditor
+        try:
+            original = original_row(origin)['text']
+        except (OSError, ValueError) as exc:
+            self.status.set('无法修正：'+str(exc))
+            return
+        TranscriptEditor(self, row_id, original)
+
+    def correct_transcript(self, row_id, text, expected=None):
+        from transcript_corrections import save_correction
+        if not 0 <= row_id < len(self.rows) or row_id not in self.row_origins:
+            raise ValueError('这段转录已不在当前记录中。')
+        row = self.rows[row_id]
+        if expected is not None and row['text'] != expected:
+            raise ValueError('这段文字已发生变化，请重新打开修正窗口。')
+        text = text.strip()
+        if text == row['text']:
+            return
+        # Persist first. A failed write leaves the displayed text and Q&A state intact.
+        corrected = save_correction(self.row_origins[row_id], text)
+        row['text'] = text
+        if corrected:
+            self.corrected_rows.add(row_id)
+        else:
+            self.corrected_rows.discard(row_id)
+        self.chat.add(row_id, {**row, 'id': row_id, 'time': self.transcript_time(row_id, row)})
+        bounds = self.text.tag_ranges(f'body:{row_id}')
+        if bounds:
+            self.text.configure(state='normal')
+            start, end = bounds
+            self.text.delete(start, end)
+            self.text.insert(start, text, (f'row:{row_id}', f'body:{row_id}'))
+            self.text.configure(state='disabled')
+        self.qa.correct_transcript(row_id, text)
+        if self.qa.active and self.qa.source in ('auto', 'manual'):
+            self.qa.cancel_request()
+            self.context_meter.set_usage()
+        self.clear_question_selection()
+        self.qa_selection = None
+        if row_id == len(self.rows)-1:
+            self.last_caption = text
+            self.refresh_caption()
+        self.status.set('转录修正已保存 · 复制和导出使用修正文字')
+        self.qa_status.set('转录已修正，可重新点击该段提问。')
+
+    def transcript_time(self, row_id, value):
+        return (row_time(value) + (' · 转录中断' if value.get('incomplete') is True else '')
+                + (' · 已修正' if row_id in self.corrected_rows else ''))
+
+    def open_correction_rule_editor(self, original, corrected):
+        if self.closing:
+            return
+        if self.transcript_editor is not None:
+            self.transcript_editor.lift()
+            return
+        from recognition_rules import load_rule_preferences
+        from transcript_editor import CorrectionRuleEditor
+        try:
+            preferences = load_rule_preferences(DATA / 'recognition-settings.json')
+        except (OSError, ValueError) as exc:
+            self.status.set('本段已修正，但规则未保存：'+str(exc))
+            return
+        CorrectionRuleEditor(self, original, corrected, preferences)
+
+    def remember_correction_rule(self, wrong, right, expected, replace=False):
+        from recognition_rules import save_rule
+        value = save_rule(DATA / 'recognition-settings.json', wrong, right, expected, replace)
+        self.hotwords.set(value)
+        self.engine.update_corrections(value)
+        self.status.set('错词规则已保存 · 用于后续识别，可在热词 / 纠错中删除')
 
     def append_row(self, row_id, value):
         follow = self.text.yview()[1] >= 0.995
         self.text.configure(state="normal")
-        self.chat.finalize(value.get("source", "system"), {**value, "id": row_id, "time": row_time(value)})
+        self.chat.finalize(value.get("source", "system"), {**value, "id": row_id, "time": self.transcript_time(row_id, value)})
         self.text.insert("end", row_time(value) + "\n", ("time", f"row:{row_id}"))
         self.text.insert("end", value["text"], (f"row:{row_id}", f"body:{row_id}"))
         self.text.insert("end", "\n")
@@ -1194,7 +1646,7 @@ class App:
         return 'break'
 
     def reset_knowledge_context(self):
-        """Keep visible history/recordings, but start a fresh context for the new customer."""
+        """Keep visible history/recordings, but start a fresh context for changed packages."""
         self.qa.reset()
         self.knowledge_history_start = len(self.qa_history)
         self.knowledge_rows_start = len(self.rows)
@@ -1204,11 +1656,14 @@ class App:
         self.context_meter.set_usage()
         self.qa_status.set('知识包已变更，后续问答使用新的资料上下文。')
 
-    def session_context_snapshot(self):
+    def session_context_snapshot(self, source=None, row_limit=None):
         # Snapshot on the UI thread; compression runs on the request worker.
-        rows = ([(row.get('source', 'system'), row['text']) for row in self.rows[getattr(self, 'knowledge_rows_start', 0):]]
+        rows = ([(row.get('source', 'system') + (' / 原转录中断' if row.get('incomplete') is True else '')
+                  + (' / 用户已修正' if index in self.corrected_rows else ''), row['text'])
+                 for index, row in enumerate(self.rows) if index >= getattr(self, 'knowledge_rows_start', 0)
+                 and (row_limit is None or index <= row_limit)]
                 if self.auto_qa.get() else [('所选上下文', text) for text in self.qa.context])
-        if self.qa.source == 'clipboard':
+        if (self.qa.source if source is None else source) in ('clipboard', 'screen'):
             rows = []
         exchanges = []
         for index, (question, answer) in enumerate(self.qa_history):
@@ -1228,7 +1683,9 @@ class App:
             self.open_qa()
             self.qa.clear_auto()
             # Old transcript provides context only, never a new request.
-            self.qa.context.extend(row['text'][-1200:] for row in self.rows[getattr(self, 'knowledge_rows_start', 0):][-8:])
+            seed = self.rows[getattr(self, 'knowledge_rows_start', 0):][-8:]
+            self.qa.context.extend(row['text'][-1200:] for row in seed)
+            self.qa.context_keys.extend(range(len(self.rows)-len(seed), len(self.rows)))
             self.clipboard_pending.clear()
             self.clipboard_watcher.start()
             self.clipboard_status.set('监听中 · 等待新复制的文字或图片')
@@ -1304,7 +1761,97 @@ class App:
         self.clipboard_request_generation = self.qa.generation
         self.clipboard_status.set(f'监听中 · {len(self.clipboard_pending)} 条待发送')
 
+    def apply_manual_cut_mouse(self):
+        selected = MOUSE_OPTIONS.get(self.manual_cut_mouse.get(), 0)
+        if self.cut_mouse is not None:
+            if selected == self.cut_mouse.button and self.cut_mouse.thread.is_alive():
+                return
+            self.cut_mouse.close()
+            self.cut_mouse = None
+        if selected and self.busy:
+            self.cut_mouse = SideButtonHotkey(self.events, self.engine.cut_active, selected)
+            self.cut_mouse.start()
+        self.manual_mouse_status.set('侧键只在转录期间生效' if selected else '鼠标侧键截断已关闭')
+
+    def request_manual_cut(self):
+        if self.closing or not self.busy or self.engine.stop_event.is_set():
+            return
+        if self.engine.request_cut():
+            self.status.set('已请求手动分段，正在处理已采集的声音…')
+        else:
+            self.status.set('分段尚未就绪、正在处理中或音频积压，请稍后再试')
+
+    def apply_screen_hotkey(self):
+        enabled = self.screen_capture_enabled.get()
+        if self.screen_hotkey is not None:
+            if enabled and self.screen_hotkey.thread and self.screen_hotkey.thread.is_alive():
+                return
+            self.screen_hotkey.close()
+            self.screen_hotkey = None
+        if enabled:
+            self.screen_capture_status.set('正在注册 Ctrl+K…')
+            self.screen_hotkey = GlobalHotkey(self.events, key=0x4B,
+                event='screen_hotkey', status_event='screen_hotkey_status')
+            self.screen_hotkey.start()
+        else:
+            self.screen_capture.cancel()
+            self.screen_pending_item = None
+            self.screen_capture_status.set('Ctrl+K 屏幕提问已关闭')
+
+    def request_screen_question(self):
+        if self.closing or not self.screen_capture_enabled.get():
+            return
+        if self.startup_overlay is not None:
+            self.qa_status.set('启动检查中，请完成后再按 Ctrl+K')
+            return
+        if self.settings_visible or self.root.grab_current() is not None:
+            self.qa_status.set('请先保存或关闭当前设置，再按 Ctrl+K')
+            return
+        if self.qa_connection.state not in ('authenticated', 'verified'):
+            self.qa_status.set('请先检查答疑模型连接，再按 Ctrl+K')
+            return
+        provider = self.qa_settings['provider']
+        profile = dict(DEFAULTS[provider], **self.qa_settings['profiles'].get(provider, {}))
+        error = image_input_error(provider, profile)
+        if error:
+            self.qa_status.set(error)
+            return
+        if self.screen_capture.request():
+            self.screen_pending_item = None
+            self.screen_capture_status.set('正在截取当前屏幕…')
+            self.qa_status.set('正在截屏…')
+
+    def handle_screen_capture(self, value):
+        generation, item, error = value
+        if (self.closing or not self.screen_capture_enabled.get()
+                or generation != self.screen_capture.generation):
+            return
+        if error or item is None:
+            self.screen_capture_status.set(error or '截屏失败，请重新按 Ctrl+K')
+            self.qa_status.set(self.screen_capture_status.get())
+            return
+        # Capture completes before opening/reflowing Wenlu's answer panel.
+        self.screen_pending_item = item
+        self.open_qa()
+        self.send_pending_screen()
+
+    def send_pending_screen(self):
+        if self.closing or self.screen_pending_item is None or self.startup_overlay is not None:
+            return
+        if self.qa_connection.state in ('unknown', 'checking'):
+            return
+        item, self.screen_pending_item = self.screen_pending_item, None
+        if self.qa_connection.state not in ('authenticated', 'verified'):
+            self.screen_capture_status.set('截图未发送：请检查答疑模型连接后重新按 Ctrl+K')
+            self.qa_status.set(self.screen_capture_status.get())
+            return
+        self.cancel_question_edit(preserve=True)
+        if self.select_question(item.text, [], image=item.image, source='screen'):
+            self.screen_capture_status.set('Ctrl+K 已发送屏幕截图 · 再按可截取新画面')
+
     def configure_qa_provider(self):
+        self.screen_capture.cancel()
+        self.screen_pending_item = None
         self.balance_query.close()
         self.balance_status.set('尚未查询')
         self.balance_detail.set('尚未更新')
@@ -1438,12 +1985,15 @@ class App:
     def toggle_question_selection(self, row_index):
         if not self.qa_enabled.get() or not 0 <= row_index < len(self.rows):
             return
+        if not self.multi_rows and self.qa_question and self.qa_answer:
+            self.qa_display_history.append((self.qa_question, self.qa_answer))
         if row_index in self.multi_rows:
             self.multi_rows.remove(row_index)
         else:
             self.multi_rows.add(row_index)
         self.qa.reset()
         self.qa_selection = None
+        self.qa_turn_ids.pop(len(self.qa_display_history), None)
         self.qa_display_images.pop(len(self.qa_display_history), None)
         self.qa_question = "\n".join(self.rows[i]["text"] for i in sorted(self.multi_rows))
         self.qa_answer = ""
@@ -1552,7 +2102,7 @@ class App:
         self.text.tag_remove("sel", "1.0", "end")
         self.chat.highlight(set())
 
-    def select_question(self, question, indices, image=None):
+    def select_question(self, question, indices, image=None, *, source='manual'):
         if not self.qa_enabled.get() or not question:
             return
         if self.qa_connection.state not in ("authenticated", "verified"):
@@ -1582,7 +2132,10 @@ class App:
         context = ([r["text"] for r in self.rows[max(0, indices[0]-8):indices[0]]]
                    + [self.rows[i]["text"] for i in indices]) if indices else [r["text"] for r in self.rows[-12:]]
         if image is not None:
-            self.qa.ask(question, [], image=image)
+            if source == 'manual':
+                self.qa.ask(question, [], image=image)
+            else:
+                self.qa.ask(question, [], image=image, source=source)
         else:
             self.qa.ask(question, context)
         self.clear_question_selection()
@@ -1638,6 +2191,13 @@ class App:
         resize()
         editor.focus_set()
         editor.mark_set('insert', 'end-1c')
+        def finish_focus():
+            # Text tag callbacks run before the parent's default mouse binding,
+            # which can take focus back after creating the embedded editor.
+            if (not self.closing and getattr(self, 'question_editor', None) is editor
+                    and editor.winfo_exists() and self.root.focus_get() in (self.qa_text, editor)):
+                editor.focus_set()
+        self.root.after_idle(finish_focus)
         return 'break'
 
     def replace_question(self, index, question, indices):
@@ -1645,10 +2205,24 @@ class App:
         if not 0 <= index < len(turns):
             return
         old = turns[index]
-        for i in range(len(self.qa_history)-1, -1, -1):
-            if tuple(self.qa_history[i]) == old:
-                self.qa_history[i] = (question, '')
-                break
+        import uuid
+        record_id = self.qa_turn_ids.get(index)
+        history_index = next((i for i, key in self.qa_history_ids.items() if key == record_id), None) if record_id else None
+        if record_id is None:
+            # Compatibility for an unregistered in-memory turn. Never guess
+            # between duplicate answers; loaded journals already have identities.
+            candidates = [i for i, pair in enumerate(self.qa_history)
+                          if tuple(pair) == old and i not in self.qa_history_ids]
+            if len(candidates) > 1:
+                self.qa_status.set('无法定位这条历史问答，请重新打开记录后再修改。')
+                return
+            record_id = uuid.uuid4().hex
+            self.qa_turn_ids[index] = record_id
+            history_index = candidates[0] if candidates else None
+            if history_index is not None:
+                self.qa_history_ids[history_index] = record_id
+        if history_index is not None:
+            self.qa_history[history_index] = (question, '')
         self.qa_selection = None
         if index < len(self.qa_display_history):
             self.qa_display_history[index] = (question, '')
@@ -1657,7 +2231,7 @@ class App:
         context = ([r['text'] for r in self.rows[max(0, indices[0]-8):indices[0]]]
                    + [self.rows[i]['text'] for i in indices]) if indices else [r['text'] for r in self.rows[-12:]]
         self.qa.ask(question, context)
-        self.qa_replacement = (self.qa.generation, index, old)
+        self.qa_replacement = (self.qa.generation, index, record_id, history_index)
         self.clear_question_selection()
         self.qa_status.set('正在回答…')
         self.render_qa()
@@ -1803,6 +2377,37 @@ class App:
             self.answer_copy_button.configure(text="已复制")
             self.root.after(1500, lambda: self.answer_copy_button.configure(text="复制"))
 
+    def commit_qa_answer(self, index, payload, record_id=None, history_index=None):
+        """Keep display, conversation and journal identities separate from text."""
+        import uuid
+        from qa_records import append_qa, replace_qa
+        record_id = record_id or uuid.uuid4().hex
+        self.qa_turn_ids[index] = record_id
+        if history_index is None:
+            history_index = len(self.qa_history)
+            self.qa_history.append(payload)
+        else:
+            self.qa_history[history_index] = payload
+        self.qa_history_ids[history_index] = record_id
+        self.qa_times.setdefault(record_id, datetime.now().astimezone().isoformat())
+        try:
+            origin = self.qa_origins.get(record_id)
+            if origin is not None:
+                self.qa_origins[record_id] = replace_qa(origin, record_id, *payload)
+            elif self.qa_journal_path or self.session:
+                path = self.qa_journal_path or self.session.with_suffix('.qa.jsonl')
+                if self.qa_journal_path and not path.is_file():
+                    raise ValueError('问答文件已不存在，请另存副本或重新打开记录。')
+                if path.resolve() in self.qa_unreadable_paths:
+                    raise ValueError('问答文件未载入，请修复并重新打开记录后再保存。')
+                self.qa_origins[record_id] = append_qa(path, record_id, *payload, timestamp=self.qa_times[record_id])
+        except (OSError, ValueError, UnicodeError) as exc:
+            self.qa_status.set('回答已显示，但保存失败；可复制回答。'+str(exc))
+        else:
+            if self.qa_journal_path:
+                count = sum(bool(answer.strip()) for _, answer in self.qa_history)
+                self.footer.set(f'问答练习 · 本轮 {count} 条已完成')
+
     def handle_qa(self, value):
         generation, state, payload = value
         if generation != self.qa.generation or not self.qa.enabled or self.closing:
@@ -1815,7 +2420,7 @@ class App:
             if state == 'thinking':
                 self.qa_status.set('正在回答…')
                 return
-            _, index, old = replacement
+            _, index, record_id, history_index = replacement
             if index < len(self.qa_display_history):
                 self.qa_display_history[index] = tuple(payload)
             else:
@@ -1823,30 +2428,11 @@ class App:
             self.render_qa()
             if state == 'answer':
                 self.qa_connection.record()
-                for i in range(len(self.qa_history)-1, -1, -1):
-                    if tuple(self.qa_history[i]) == old or tuple(self.qa_history[i]) == (payload[0], ''):
-                        self.qa_history[i] = payload
-                        break
                 self.qa_status.set('')
-                if self.session:
-                    path = self.session.with_suffix('.qa.jsonl')
-                    try:
-                        records = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()] if path.exists() else []
-                        record = dict(time=datetime.now().astimezone().isoformat(), question=payload[0], answer=payload[1])
-                        for i in range(len(records)-1, -1, -1):
-                            if (records[i].get('question'), records[i].get('answer')) == old:
-                                records[i] = record
-                                break
-                        else:
-                            records.append(record)
-                        temporary = path.with_suffix('.tmp')
-                        temporary.write_text(''.join(json.dumps(row, ensure_ascii=False)+'\n' for row in records), encoding='utf-8')
-                        temporary.replace(path)
-                    except (OSError, ValueError):
-                        self.qa_status.set('回答已显示，但保存失败；可复制回答')
+                self.commit_qa_answer(index, payload, record_id, history_index)
             return
         if state == "thinking":
-            prepared_image = (self.qa.source == 'manual' and self.qa_selection is not None
+            prepared_image = (self.qa.source in ('manual', 'screen') and self.qa_selection is not None
                               and self.qa_question == payload and not self.qa_answer)
             self.qa_selection = None
             if self.qa_question and (self.qa_question != payload or self.qa_answer):
@@ -1871,16 +2457,9 @@ class App:
             if self.qa_pending_image_context and self.qa_pending_image_context[0] == generation:
                 self.qa_image_contexts[len(self.qa_history)] = self.qa_pending_image_context[1]
             self.qa_pending_image_context = None
-            self.qa_history.append(payload)
             self.render_qa(streaming=True)
             self.qa_status.set("")
-            if self.session:
-                try:
-                    with self.session.with_suffix(".qa.jsonl").open("a", encoding="utf-8") as file:
-                        file.write(json.dumps({"time": datetime.now().astimezone().isoformat(),
-                                               "question": payload[0], "answer": payload[1]}, ensure_ascii=False) + "\n")
-                except OSError:
-                    self.qa_status.set("回答已显示，但保存失败；可复制回答")
+            self.commit_qa_answer(len(self.qa_display_history), payload)
         elif state == "error":
             self.qa_pending_image_context = None
             if self.clipboard_request_generation == generation:
@@ -1901,14 +2480,19 @@ class App:
         if not self.rows:
             messagebox.showinfo("导出", "尚无转写文字。")
             return
-        path = filedialog.asksaveasfilename(defaultextension=".txt",
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".txt",
                   initialfile=datetime.now().strftime("闻录-%Y%m%d-%H%M%S.txt"),
                   filetypes=[("文本", "*.txt"), ("字幕", "*.srt")])
         if path:
             try:
-                Path(path).write_text(export_text(self.rows, path.lower().endswith(".srt")), encoding="utf-8-sig")
-            except OSError as exc:
-                messagebox.showerror("导出失败", str(exc))
+                recordings = {origin.path for origin in self.row_origins.values()}
+                if self.session:
+                    recordings.add(self.session)
+                sources = {file for recording in recordings for file in
+                           (recording, recording.with_suffix('.txt'))}
+                save_transcript_export(path, self.rows, source_paths=sources)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("导出失败", str(exc), parent=self.root)
 
     def open_caption(self):
         if self.caption_window and self.caption_window.winfo_exists():
@@ -1947,6 +2531,22 @@ class App:
         self.text.configure(state="disabled")
         self.refresh_caption()
 
+    def recording_save_error(self, error):
+        self.failed = self.session_save_failed = True
+        self.engine.stop()
+        # This is an error-induced stop, not the user's confirmation that a
+        # spoken question is finished. Completed queued turns remain intact.
+        self.qa.interrupt_voice()
+        self.status.set(f"自动保存失败，请导出当前文字：{error}")
+        self.footer.set(f"{len(self.session_rows)} 段 · 自动保存中断，请导出")
+        if self.auto_qa.get():
+            self.qa_status.set('自动保存失败，录音已停止；请核对尾句后手动提问。')
+
+    def feed_automatic_voice(self, row, index):
+        if self.auto_qa.get() and not self.session_save_failed:
+            self.qa.feed(row['text'], row.get('source', 'system'), record_key=index,
+                         complete=row.get('incomplete') is not True)
+
     def poll(self):
         if self.startup_checks is not None:
             self.startup_checks.poll()
@@ -1972,8 +2572,12 @@ class App:
                 self.gpu_check_button.configure(state='disabled' if self.gpu_check.active else 'normal')
             elif kind == 'recognition_backend':
                 name, backend = value
+                self.storage_hint.set('')
                 self.gpu_runtime_status.set(f'已加载模型：{name} · ' +
                     ('GPU 加速已启用' if backend == 'cuda' else 'CPU（未启用 GPU 加速）'))
+            elif kind == 'capture_loading':
+                self.storage_hint.set('音频暂存中…')
+                self.gpu_runtime_status.set(f'已开始采集，正在加载 {value}；音频暂存中…')
             elif kind == "tray_show":
                 self.root.deiconify()
                 self.root.lift()
@@ -1985,6 +2589,28 @@ class App:
                 self.handle_qa(value)
             elif kind == 'clipboard':
                 self.handle_clipboard(value)
+            elif kind == 'manual_cut':
+                self.request_manual_cut()
+            elif kind == 'manual_cut_done':
+                if self.busy and not self.engine.stop_event.is_set():
+                    self.status.set('已手动分段 · 继续转写')
+            elif kind == 'manual_cut_status':
+                ok, reason = value
+                self.manual_cut_status.set('Ctrl+Shift+空格：手动分段' if ok else '分段快捷键不可用：'+reason)
+            elif kind == 'manual_mouse_status':
+                ok, reason = value
+                self.manual_mouse_status.set('侧键已就绪 · 仅转录期间接管' if ok else '侧键不可用：'+reason)
+            elif kind == 'screen_hotkey':
+                self.request_screen_question()
+            elif kind == 'screen_capture':
+                self.handle_screen_capture(value)
+            elif kind == 'screen_hotkey_status':
+                ok, reason = value
+                if self.screen_capture_enabled.get() and self.screen_hotkey is not None:
+                    self.screen_capture_status.set('Ctrl+K 已就绪 · 按下截取当前屏幕并发送' if ok else 'Ctrl+K 不可用：'+reason)
+                    logging.info('Screen capture hotkey Ctrl+K: %s', 'ready' if ok else reason)
+                    if not ok:
+                        self.qa_status.set(self.screen_capture_status.get())
             elif kind == "qa_connection":
                 self.render_qa_connection()
             elif kind == 'qa_balance':
@@ -2006,42 +2632,57 @@ class App:
                 self.set_level(value)
             elif kind == "backlog":
                 self.storage_hint.set(f"积压 {value:.0f}s" if value >= 2 else "")
-                self.footer.set(f"积压 {value:.0f}s · {len(self.session_rows)} 段" if value >= 2 else f"已保存 {len(self.session_rows)} 段")
+                if self.session_save_failed:
+                    self.footer.set(f"{len(self.session_rows)} 段 · 自动保存中断，请导出")
+                else:
+                    self.footer.set(f"积压 {value:.0f}s · {len(self.session_rows)} 段" if value >= 2 else f"已保存 {len(self.session_rows)} 段")
             elif kind == "preview":
                 self.show_preview(value)
+            elif kind == 'voice_activity':
+                self.qa.observe_voice(value['source'], value['active'])
+            elif kind == 'qa_notice':
+                epoch, message = value
+                if epoch == self.qa.voice_epoch and self.auto_qa.get():
+                    self.qa_status.set(message)
             elif kind == "segment":
                 self.last_caption = value["text"]
                 self.show_preview("", value.get("source", "system"), keep_bubble=True)
                 self.rows.append(value)
                 self.session_rows.append(value)
-                try:
-                    with self.session.open("a", encoding="utf-8") as file:
-                        file.write(json.dumps(value, ensure_ascii=False) + "\n")
-                    self.session.with_suffix(".txt").write_text(export_text(self.session_rows), encoding="utf-8-sig")
-                except OSError as exc:
-                    self.failed = True
-                    self.engine.stop()
-                    self.status.set(f"自动保存失败，请导出当前文字：{exc}")
+                if not self.session_save_failed:
+                    try:
+                        save_segment(self.session, value)
+                    except OSError as exc:
+                        self.recording_save_error(exc)
+                    else:
+                        from transcript_corrections import row_origin
+                        self.row_origins[len(self.rows)-1] = row_origin(self.session, len(self.session_rows)-1, value)
                 self.append_row(len(self.rows) - 1, value)
-                if self.auto_qa.get():
-                    self.qa.feed(value["text"])
+                self.feed_automatic_voice(value, len(self.rows)-1)
                 self.refresh_caption()
             elif kind == "error":
                 self.failed = True
+                self.qa.interrupt_voice()
                 self.status.set("转写失败：" + value)
                 messagebox.showerror("转写失败", value)
             elif kind == "done":
+                self.qa.voice_activity.clear()
                 self.show_preview("")
                 self.set_busy(False)
                 self.set_level(0)
                 if not self.failed:
                     self.status.set(f"已停止 · {len(self.session_rows)} 段已保存")
+        # Seal voice turns while requests are busy or the service is unavailable.
+        # Dispatch remains gated below; an open editor can still revise the queue.
+        if self.auto_qa.get() and not self.closing:
+            self.qa.collect_voice()
         # Alternate ready voice and clipboard work when both queues are busy.
-        if (self.qa.source == 'clipboard' and self.auto_qa.get() and not self.closing
+        if (self.qa.source == 'clipboard' and self.auto_qa.get() and not self.closing and self.transcript_editor is None
                 and self.qa_connection.state in ('authenticated', 'verified')):
             self.qa.tick()
+        self.send_pending_screen()
         self.send_pending_clipboard()
-        if (self.auto_qa.get() and not self.closing
+        if (self.auto_qa.get() and not self.closing and self.transcript_editor is None
                 and self.qa_connection.state in ("authenticated", "verified")):
             self.qa.tick()
         self.root.after(100, self.poll)
@@ -2068,17 +2709,32 @@ class App:
         self.qa_connection.close()
         self.balance_query.close()
         self.hotkey.close()
+        self.cut_hotkey.close()
+        if self.cut_mouse is not None:
+            self.cut_mouse.close()
+        self.screen_capture.cancel()
+        self.screen_pending_item = None
+        if self.screen_hotkey is not None:
+            self.screen_hotkey.close()
         if self.busy:
             self.stop()
             self.status.set("正在处理剩余音频，完成后自动关闭…")
             self.root.after(200, self.close_when_done)
         else:
-            self.root.destroy()
+            self.finish_close()
 
     def close_when_done(self):
         if self.busy:
             self.root.after(200, self.close_when_done)
         else:
+            self.finish_close()
+
+    def finish_close(self):
+        try:
+            self.engine.unload_model()
+        except Exception:
+            logging.exception('Releasing recognition model during exit')
+        finally:
             self.root.destroy()
 
 
@@ -2099,6 +2755,16 @@ if __name__ == "__main__":
         instance.close()
         raise SystemExit(0)
     migrate_legacy()
+    from bundled_delivery import bootstrap_delivery
+    try:
+        bootstrap_delivery()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        error_root = tk.Tk()
+        error_root.withdraw()
+        messagebox.showerror('客户资料初始化失败', str(exc), parent=error_root)
+        error_root.destroy()
+        instance.close()
+        raise SystemExit(1)
     app = App(tk.Tk())
     from knowledge_import import start_import_server
     import_server = None

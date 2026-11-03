@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import ttk
+import ctypes
+from ctypes import wintypes
 from types import SimpleNamespace
 import unittest
 import tempfile
@@ -12,8 +14,13 @@ from qa_settings_dialog import show
 
 class SettingsInteractionTests(unittest.TestCase):
     def setUp(self):
+        # Personal desktop settings must not change the expected initial UI state.
+        preferences = patch('app.preferences', return_value={})
+        preferences.start()
+        self.addCleanup(preferences.stop)
         for name in ('app.GlobalHotkey', 'app.App.start_tray', 'app.ClipboardWatcher',
-                     'qa_connection.QAConnection.check', 'app.save_desktop'):
+                     'qa_connection.QAConnection.check', 'app.save_desktop',
+                     'app.save_preferences'):
             mocked = patch(name)
             mocked.start()
             self.addCleanup(mocked.stop)
@@ -27,6 +34,57 @@ class SettingsInteractionTests(unittest.TestCase):
             self.root.after_cancel(timer)
         self.app.close()
 
+    def test_manual_cut_mouse_is_saved_and_cancel_restores_draft(self):
+        app = self.app
+        original = app.manual_cut_mouse.get()
+        app.manual_cut_mouse.set('关闭')
+        app.hide_settings()
+        self.assertEqual(app.manual_cut_mouse.get(), original)
+        app.toggle_settings()
+        app.manual_cut_mouse.set('侧键 2（前进）')
+        with patch('app.save_desktop') as save, patch('reference_settings.save_settings'):
+            app.settings_save_button.invoke()
+        self.assertEqual(save.call_args.args[0]['manual_cut_mouse'], '侧键 2（前进）')
+        self.assertIsNone(app.cut_mouse)  # Idle: no hook is installed just by saving.
+
+    def test_qwen_model_help_explains_acoustic_hint_behavior(self):
+        from qwen_engine import QWEN_LABEL
+        self.app.model.set(QWEN_LABEL)
+        self.assertIn('普通热词不参与',self.app.recognition_help.get())
+        self.assertIn('纠错规则仍然生效',self.app.recognition_help.get())
+        self.app.model.set('small · 轻量准确')
+        self.assertIn('普通词用于识别提示',self.app.recognition_help.get())
+
+    def test_model_loading_shows_capture_buffering_until_backend_is_ready(self):
+        self.app.events.put(('capture_loading', 'qwen3-asr'))
+        self.app.poll()
+        self.assertEqual(self.app.storage_hint.get(), '音频暂存中…')
+        self.assertIn('已开始采集', self.app.gpu_runtime_status.get())
+        self.app.events.put(('recognition_backend', ('qwen3-asr', 'cuda')))
+        self.app.poll()
+        self.assertEqual(self.app.storage_hint.get(), '')
+        self.assertIn('GPU 加速已启用', self.app.gpu_runtime_status.get())
+
+    def test_missing_qwen_component_does_not_start_a_whisper_download(self):
+        from qwen_engine import QWEN_MODEL
+        current=self.app.model.get()
+        with patch('model_download.cached_model',return_value=None),patch('multiprocessing.get_context') as context:
+            self.app.open_model_manager()
+            window=self.app._model_window
+            choice=next(w for w in window.winfo_children() if isinstance(w,ttk.Combobox))
+            index=next(i for i,label in enumerate(choice['values']) if label.split()[0]==QWEN_MODEL)
+            choice.current(index);choice.event_generate('<<ComboboxSelected>>')
+            self.root.update()
+            button=next(w for w in window.winfo_children() if isinstance(w,tk.Button))
+            self.assertEqual(button.cget('text'),'安装说明')
+            button.invoke()
+            context.assert_not_called()
+            labels=[self.root.getvar(w.cget('textvariable')) for w in window.winfo_children()
+                    if isinstance(w,ttk.Label) and w.cget('textvariable')]
+            self.assertTrue(any('BF16' in text and '组件' in text for text in labels))
+            self.assertEqual(self.app.model.get(),current)
+            window.destroy()
+
     def test_sections_are_separated_and_redundant_actions_removed(self):
         tabs = self.app.settings_tabs
         self.assertEqual([button.cget('text') for _, button in tabs.pages.values()],
@@ -34,9 +92,21 @@ class SettingsInteractionTests(unittest.TestCase):
         appearance = str(self.app.settings_pages['appearance'])
         self.assertTrue(str(self.app.font_size_picker).startswith(appearance + '.'))
         self.assertTrue(str(self.app.pin_button).startswith(appearance + '.'))
-        self.assertEqual(set(self.app.settings_actions), {'导出记录', '历史记录', '关于与更新'})
+        self.assertEqual(set(self.app.settings_actions), {'导出记录', '保存问答副本', '打开练习', '历史记录', '关于与更新'})
         self.assertFalse(hasattr(self.app, 'startup_notice'))
         self.assertEqual(self.app.settings_save_button.cget('text'), '保存')
+
+    def test_interview_terms_are_optional_and_cancel_restores_original(self):
+        app = self.app
+        original = app.hotwords.get()
+        app.hotwords.set('密等性=幂等性')
+        app.hotwords_presets.invoke(0)
+        self.assertIn('LangChain', app.hotwords.get())
+        self.assertIn('密等性=幂等性', app.hotwords.get())
+        self.root.update()
+        self.assertGreater(app.hotwords_entry.winfo_width(), 100)
+        app.hide_settings()
+        self.assertEqual(app.hotwords.get(), original)
 
     def test_click_raises_settings_without_pinning_app_or_changing_input_focus(self):
         app = self.app
@@ -61,6 +131,127 @@ class SettingsInteractionTests(unittest.TestCase):
         self.root.update()
         self.assertIs(self.root.grab_current(), window)
         self.assertTrue(self.root.tk.call('wm', 'stackorder', window, 'isabove', self.app.settings_window))
+
+    def test_cancel_service_dialog_returns_keyboard_focus_to_settings(self):
+        self.app.hotwords_entry.focus_force()
+        self.root.update()
+        window = show(self.app)
+        self.root.update()
+        fields = next(child for child in window.winfo_children() if isinstance(child, ttk.Frame))
+        entry = next(child for child in fields.winfo_children() if isinstance(child, ttk.Entry))
+        entry.focus_force()
+        self.root.update()
+        actions = [child for child in window.winfo_children() if isinstance(child, ttk.Frame)][-1]
+        cancel = next(child for child in actions.winfo_children() if child.cget('text') == '取消')
+        cancel.invoke()
+        self.root.update()
+        self.assertIs(self.root.grab_current(), self.app.settings_window)
+        self.assertIs(self.root.focus_get(), self.app.hotwords_entry)
+        self.root.focus_get().event_generate('<Escape>')
+        self.root.update()
+        self.assertFalse(self.app.settings_visible)
+        self.assertIsNone(self.root.grab_current())
+
+    def test_escape_cancels_service_draft_before_closing_parent_settings(self):
+        self.app.settings_tabs.focus_force()
+        self.root.update()
+        original = self.app.qa_settings.copy()
+        window = show(self.app)
+        window.focus_force()
+        self.root.update()
+        with patch('qa_settings_dialog.save_settings') as save:
+            window.event_generate('<Escape>')
+            self.root.update()
+        save.assert_not_called()
+        self.assertEqual(self.app.qa_settings, original)
+        self.assertFalse(window.winfo_exists())
+        self.assertTrue(self.app.settings_visible)
+        self.assertIs(self.root.grab_current(), self.app.settings_window)
+        self.assertIs(self.root.focus_get(), self.app.settings_tabs)
+
+    def test_close_model_manager_restores_parent_focus_and_escape(self):
+        self.app.model_manage_button.focus_force()
+        self.root.update()
+        self.app.open_model_manager()
+        window = self.app._model_window
+        self.root.update()
+        window.focus_force()
+        self.root.update()
+        window.event_generate('<Escape>')
+        self.root.update()
+        self.assertFalse(window.winfo_exists())
+        self.assertIs(self.root.grab_current(), self.app.settings_window)
+        self.assertIs(self.root.focus_get(), self.app.model_manage_button)
+        self.root.focus_get().event_generate('<Escape>')
+        self.root.update()
+        self.assertFalse(self.app.settings_visible)
+
+    def test_escape_cancels_model_download_and_restores_keyboard_control(self):
+        from unittest.mock import Mock
+        callback_errors = []
+        self.root.report_callback_exception = lambda *error: callback_errors.append(error)
+        receiver, sender, job, context = Mock(), Mock(), Mock(), Mock()
+        context.Pipe.return_value = receiver, sender
+        context.Process.return_value = job
+        receiver.poll.return_value = False
+        job.is_alive.return_value = True
+        self.app.model_manage_button.focus_force()
+        self.root.update()
+        with patch('model_download.cached_model', return_value=None), \
+                patch('multiprocessing.get_context', return_value=context):
+            self.app.open_model_manager()
+            window = self.app._model_window
+            choice = next(child for child in window.winfo_children() if isinstance(child, ttk.Combobox))
+            choice.current(0)
+            choice.event_generate('<<ComboboxSelected>>')
+            action = next(child for child in window.winfo_children() if isinstance(child, tk.Button))
+            action.invoke()
+            self.assertEqual(action.cget('text'), '取消下载')
+            window.focus_force()
+            self.root.update()
+            window.event_generate('<Escape>')
+            self.root.update()
+        job.terminate.assert_called_once()
+        job.join.assert_called_once_with(timeout=1)
+        receiver.close.assert_called_once()
+        self.assertFalse(window.winfo_exists())
+        self.assertIs(self.root.focus_get(), self.app.model_manage_button)
+        self.assertIs(self.root.grab_current(), self.app.settings_window)
+        self.assertEqual(callback_errors, [])
+
+    def test_startup_service_dialog_without_previous_focus_can_escape_back_to_app(self):
+        self.root.tk.call('focus', '')
+        self.assertIsNone(self.root.focus_get())
+        window = show(self.app)
+        window.focus_force()
+        self.root.update()
+        window.event_generate('<Escape>')
+        self.root.update()
+        self.assertIs(self.root.focus_get(), self.app.settings_window)
+        self.assertIs(self.root.grab_current(), self.app.settings_window)
+        self.root.focus_get().event_generate('<Escape>')
+        self.root.update()
+        self.assertFalse(self.app.settings_visible)
+        self.assertIsNone(self.root.grab_current())
+
+    def test_escape_on_owner_closes_active_child_without_orphaning_it(self):
+        for kind in ('service', 'model'):
+            with self.subTest(dialog=kind):
+                if kind == 'service':
+                    window = show(self.app)
+                else:
+                    self.app.open_model_manager()
+                    window = self.app._model_window
+                self.root.update()
+                self.app.settings_tabs.focus_force()
+                self.root.update()
+                self.assertIs(self.root.grab_current(), window)
+                self.app.hide_settings(SimpleNamespace(keysym='Escape'))
+                self.root.update()
+                self.assertFalse(window.winfo_exists())
+                self.assertTrue(self.app.settings_visible)
+                self.assertTrue(self.app.settings_window.winfo_viewable())
+                self.assertIs(self.root.grab_current(), self.app.settings_window)
 
     def test_cancel_restores_drafts_and_preview_without_saving(self):
         app = self.app
@@ -103,6 +294,42 @@ class SettingsInteractionTests(unittest.TestCase):
             start.assert_not_called()
         app.toggle_settings()
         self.assertEqual(app.echo_cancellation.get(), not original)
+
+    def test_question_source_is_draft_until_save_and_automatically_handles_mic_only(self):
+        app = self.app
+        self.assertEqual(app.qa.question_source, 'system')
+        app.question_source.set('麦克风')
+        self.assertEqual(app.qa.question_source, 'system')
+        app.hide_settings()
+        self.assertEqual(app.question_source.get(), '自动（优先系统声音）')
+        app.toggle_settings()
+        app.question_source.set('麦克风')
+        with patch('app.save_desktop') as save, patch('reference_settings.save_settings'):
+            app.settings_save_button.invoke()
+        self.assertEqual(app.qa.question_source, 'microphone')
+        self.assertEqual(save.call_args.args[0]['question_source'], '麦克风')
+        app.question_source.set('两路声音')
+        with patch('app.preferences', return_value=save.call_args.args[0]):
+            app.load_desktop_settings()
+        self.assertEqual(app.question_source.get(), '麦克风')
+        self.assertEqual(app.qa.question_source, 'microphone')
+        app.toggle_settings()
+        app.question_source.set('自动（优先系统声音）')
+        app.recording_sources = {'microphone'}
+        app.apply_question_source()
+        self.assertEqual(app.qa.question_source, 'microphone')
+        app.recording_sources = {'system', 'microphone'}
+        app.update_question_source()
+        self.assertEqual(app.qa.question_source, 'system')
+
+    def test_failed_save_does_not_apply_question_source(self):
+        app = self.app
+        app.question_source.set('麦克风')
+        with patch.object(app, 'save_desktop_settings', side_effect=OSError('write failed')), \
+                patch('app.messagebox.showerror'):
+            app.settings_save_button.invoke()
+        self.assertEqual(app.qa.question_source, 'system')
+        self.assertEqual(app.question_source.get(), '麦克风')
 
     def test_unselected_audio_devices_save_cancel_and_reload(self):
         app = self.app
@@ -212,7 +439,11 @@ class SettingsInteractionTests(unittest.TestCase):
             self.assertEqual(desktop.call_args.args[0]['font_size'], 12)
             references.assert_called_once()
             start.assert_called_once()
-            app.toggle_settings()
+            # The writes above are mocks; model their persisted value when the
+            # dialog now refreshes the saved word list on reopening.
+            with patch('app.load_wordlist_snapshot', return_value=('闻录,新词', None)) as read:
+                app.toggle_settings()
+                read.assert_called_once()
             self.assertEqual(app.hotwords.get(), '闻录,新词')
             self.assertTrue(app.settings_auto_qa.get())
 
@@ -238,6 +469,12 @@ class SettingsInteractionTests(unittest.TestCase):
 
     def test_capture_privacy_only_applies_after_save_and_can_be_disabled(self):
         app = self.app
+        api = ctypes.windll.user32
+        api.GetParent.argtypes = [wintypes.HWND]
+        api.GetParent.restype = wintypes.HWND
+        api.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        def taskbar_style():
+            return api.GetWindowLongW(api.GetParent(self.root.winfo_id()), -20)
         self.assertFalse(app.capture_privacy.enabled)
         app.capture_hidden.set(True)
         self.assertFalse(app.capture_privacy.enabled)
@@ -249,12 +486,16 @@ class SettingsInteractionTests(unittest.TestCase):
             app.settings_save_button.invoke()
             self.assertTrue(app.capture_privacy.enabled)
             self.assertTrue(save.call_args.args[0]['capture_hidden'])
+            self.assertTrue(taskbar_style() & 0x80)
+            self.assertFalse(taskbar_style() & 0x40000)
             app.toggle_settings()
             app.capture_hidden.set(False)
             self.assertTrue(app.capture_privacy.enabled)
             app.settings_save_button.invoke()
             self.assertFalse(app.capture_privacy.enabled)
             self.assertFalse(save.call_args.args[0]['capture_hidden'])
+            self.assertFalse(taskbar_style() & 0x80)
+            self.assertTrue(taskbar_style() & 0x40000)
 
     def test_failed_save_restores_previous_capture_mode(self):
         app = self.app

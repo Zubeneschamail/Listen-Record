@@ -5,10 +5,12 @@ import threading
 
 
 class GlobalHotkey:
-    def __init__(self, events, modifiers=0x0002, key=0x20):
+    def __init__(self, events, modifiers=0x0002, key=0x20, *, event='hotkey', status_event='hotkey_status'):
         self.events = events
         self.modifiers = modifiers
         self.key = key
+        self.event = event
+        self.status_event = status_event
         self.stopped = threading.Event()
         self.thread = None
 
@@ -36,16 +38,16 @@ class GlobalHotkey:
             registered = bool(user32.RegisterHotKey(None, 1, self.modifiers | 0x4000, self.key))
             if not registered:
                 error = ctypes.get_last_error()
-                self.events.put(("hotkey_status", (False, f"注册失败，可能已被占用（{error}）")))
+                self.events.put((self.status_event, (False, f"注册失败，可能已被占用（{error}）")))
                 return
-            self.events.put(("hotkey_status", (True, "")))
+            self.events.put((self.status_event, (True, "")))
             message = wintypes.MSG()
             while not self.stopped.wait(0.02):
                 while user32.PeekMessageW(ctypes.byref(message), None, 0x0312, 0x0312, 1):
                     if message.wParam == 1 and not self.stopped.is_set():
-                        self.events.put(("hotkey", None))
+                        self.events.put((self.event, None))
         except Exception as exc:
-            self.events.put(("hotkey_status", (False, str(exc))))
+            self.events.put((self.status_event, (False, str(exc))))
         finally:
             if registered:
                 user32.UnregisterHotKey(None, 1)

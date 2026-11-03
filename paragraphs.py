@@ -28,6 +28,8 @@ class ParagraphAssembler:
         else:
             self.pending['text'] = join_text(self.pending['text'], row['text'])
             self.pending['end'] = max(self.pending['end'], row['end'])
+            if row.get('incomplete') is True:
+                self.pending['incomplete'] = True
         text = self.pending['text']
         duration = self.pending['end']-self.pending['start']
         if ((len(text) >= 240 or duration >= 45) and re.search(r'[。！？.!?][”’"\']?$', text)) or len(text) >= 600 or duration >= 90:

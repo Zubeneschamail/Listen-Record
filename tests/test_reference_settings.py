@@ -1,5 +1,7 @@
 from pathlib import Path
 import tempfile
+import threading
+import time
 import tkinter as tk
 import unittest
 from unittest.mock import patch
@@ -7,6 +9,48 @@ from app import App
 
 
 class ReferenceSettingsTests(unittest.TestCase):
+    def test_knowledge_package_validation_does_not_block_ui(self):
+        started, release, ui_tick = threading.Event(), threading.Event(), threading.Event()
+        package = r'F:\slow\engine.wlkb'
+
+        def slow_validation(value):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError('validation stalled')
+            return value
+
+        with patch('app.GlobalHotkey'), patch('app.App.start_tray'), \
+                patch('qa_connection.QAConnection.check'), \
+                patch('reference_settings.load_settings', return_value={'enabled': False, 'paths': []}), \
+                patch('reference_settings.save_settings') as save, \
+                patch('reference_settings.validate_source', side_effect=slow_validation), \
+                patch('knowledge_packages.validate_selection'):
+            root = tk.Tk()
+            root.withdraw()
+            app = App(root)
+            try:
+                app.reference_controls['add']([package])
+                self.assertTrue(started.wait(1))
+                self.assertEqual(app.reference_controls['listing'].size(), 0)
+                root.after(0, ui_tick.set)
+                root.update()
+                self.assertTrue(ui_tick.is_set())
+                release.set()
+                deadline = time.monotonic() + 5
+                while not save.called:
+                    self.assertLess(time.monotonic(), deadline)
+                    root.update()
+                    time.sleep(.01)
+                self.assertEqual(save.call_args.args[0]['paths'], [package])
+            finally:
+                release.set()
+                app.qa.set_enabled(False)
+                app.qa_connection.close()
+                app.hotkey.close()
+                for timer in root.tk.call('after', 'info'):
+                    root.after_cancel(timer)
+                root.destroy()
+
     def test_add_persist_remove_without_deleting_source(self):
         data = {'enabled': False, 'paths': []}
         with tempfile.TemporaryDirectory() as directory, patch('app.GlobalHotkey'), \

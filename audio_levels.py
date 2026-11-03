@@ -3,8 +3,9 @@ import numpy as np
 
 
 class AudioLevelNormalizer:
-    def __init__(self):
+    def __init__(self, max_gain=64.):
         self.gain = None
+        self.max_gain = max_gain
 
     def process(self, audio):
         audio = np.nan_to_num(audio, nan=0., posinf=0., neginf=0.)
@@ -15,7 +16,7 @@ class AudioLevelNormalizer:
         # Do not raise silence/the numerical noise floor into audible noise.
         if rms < 1e-5:
             return audio
-        target = min(64., max(1., .015 / rms), .98 / max(peak, 1e-9))
+        target = min(self.max_gain, max(1., .015 / rms), .98 / max(peak, 1e-9))
         if self.gain is None or target < self.gain:
             self.gain = target  # Immediately protect louder speech from clipping.
         else:

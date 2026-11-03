@@ -21,6 +21,19 @@ def dialog(app, title):
     return window
 
 
+def restore_dialog_focus(app, previous=None):
+    """Return a closed child dialog's keyboard focus to its visible owner."""
+    parent = app.settings_window if app.settings_window.winfo_viewable() else app.root
+    if parent is app.settings_window:
+        parent.grab_set()
+        app.raise_settings()
+    target = parent
+    if previous is not None and previous.winfo_exists() and previous.winfo_viewable():
+        if previous.winfo_toplevel() is parent:
+            target = previous
+    target.focus_set()
+
+
 def about(app):
     from updates import check_update, download_update, launch_installer_when_closed
     window = dialog(app, '关于闻录')
@@ -64,10 +77,12 @@ def model_manager(app, on_close=None):
     import multiprocessing as mp
     import time
     from model_download import cached_model, download_worker, BUNDLED_MODELS, progress_text
+    from qwen_engine import MODEL_LABELS, QWEN_MODEL, QWEN_HELP, INSTALL_HELP
     existing = getattr(app, '_model_window', None)
     if existing is not None and existing.winfo_exists():
         existing.lift()
         return
+    previous_focus = app.root.focus_get()
     window = dialog(app, '模型管理')
     if app.settings_window.winfo_viewable():
         window.transient(app.settings_window)
@@ -76,13 +91,14 @@ def model_manager(app, on_close=None):
     window.configure(bg='#f7f8fa')
     ttk.Label(window, text='转录模型', font=(typography.UI_FAMILY, 12, 'bold')).pack(anchor='w')
     ttk.Label(window, text='统一下载和切换；下载完成后可离线使用。').pack(anchor='w', pady=(6, 0))
-    names = ['small', 'large-v3-turbo', 'base', 'tiny']
+    names = [label.split()[0] for label in MODEL_LABELS]
     def model_labels():
         result = []
         current = app.model.get().split()[0]
         for name in names:
             path = cached_model(name)
-            state = '内置' if path == BUNDLED_MODELS / name else '已下载' if path else '未下载'
+            state = ('组件已安装' if path else '需安装组件') if name == QWEN_MODEL else (
+                '内置' if path == BUNDLED_MODELS / name else '已下载' if path else '未下载')
             result.append(f'{name} · {state}' + (' · 使用中' if name == current else ''))
         return result
     choice = ttk.Combobox(window, values=model_labels(),
@@ -128,8 +144,9 @@ def model_manager(app, on_close=None):
         choice.configure(values=model_labels())
         choice.current(names.index(name))
         ready = cached_model(name) is not None
-        status.set('已找到本机模型，可直接离线使用。' if ready else '尚未下载此模型。首次下载需要连接网络。')
-        button.configure(text='使用此模型' if ready else '下载模型')
+        status.set((QWEN_HELP if ready else INSTALL_HELP) if name == QWEN_MODEL else (
+            '已找到本机模型，可直接离线使用。' if ready else '尚未下载此模型。首次下载需要连接网络。'))
+        button.configure(text='使用此模型' if ready else '安装说明' if name == QWEN_MODEL else '下载模型')
 
     def poll():
         nonlocal connected, poll_id
@@ -178,6 +195,9 @@ def model_manager(app, on_close=None):
             stop_job()
             status.set('已取消下载，重试时将复用已下载的文件。')
             return
+        if selected() == QWEN_MODEL and cached_model(selected()) is None:
+            status.set(INSTALL_HELP)
+            return
         if cached_model(selected()) is not None and button.cget('text') != '下载 / 重试':
             if app.busy:
                 status.set('请先停止转写，再切换模型。')
@@ -212,14 +232,16 @@ def model_manager(app, on_close=None):
         progress.start(15)
         poll_id = app.root.after(150, poll)
 
-    def close():
+    def close(event=None):
         stop_job()
         window.grab_release()
+        # Focus the owner while the active native child still exists. After
+        # destruction Windows can activate another app, making focus_set a no-op.
+        restore_dialog_focus(app, previous_focus)
         window.destroy()
-        if app.settings_window.winfo_viewable():
-            app.settings_window.grab_set()
         if on_close:
             app.root.after_idle(on_close)
+        return 'break'
 
     button = tk.Button(window, text='下载模型', command=start, bg='#007ACC', fg='white',
                        activebackground='#006BB3', activeforeground='white', relief='flat',
@@ -227,6 +249,7 @@ def model_manager(app, on_close=None):
     button.pack(anchor='e', pady=(14, 0))
     choice.bind('<<ComboboxSelected>>', refresh)
     window.protocol('WM_DELETE_WINDOW', close)
+    window.bind('<Escape>', close)
     window.bind('<Destroy>', lambda event: stop_job() if event.widget is window else None)
     refresh()
     window.update_idletasks()

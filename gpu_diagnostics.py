@@ -8,6 +8,17 @@ def probe_gpu(name, progress):
     import ctranslate2
     from model_download import cached_model
     from model_runtime import prepare_cuda, cuda_runtime_errors, load_model
+    from qwen_engine import QWEN_MODEL
+    if name == QWEN_MODEL:
+        from model_runtime import release_model
+        model = None
+        try:
+            model = load_model(name, device='cuda', status=progress)
+            if model.model.device != 'cuda':
+                raise RuntimeError('识别引擎未使用 GPU。')
+            return '中文准确模型与词时间戳已在 GPU 完成实际推理；检测不会切换当前转录模型。'
+        finally:
+            release_model(model)
 
     progress('正在检查 NVIDIA 显卡与驱动…')
     prepare_cuda()

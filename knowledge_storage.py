@@ -1,4 +1,4 @@
-"""Bounded-memory SQLite vector scan; kept identical to Wenlu knowledge_storage.py."""
+"""Bounded-memory SQLite vector ranking."""
 import heapq
 
 MAX_SIZE = 8 * 1024 ** 3
@@ -7,11 +7,19 @@ MAX_MANIFEST = 64 * 1024 ** 2
 SCAN_BATCH = 512
 
 
-def semantic_top(connection, query_vector, top_k=20, check=lambda: None):
+def semantic_top(connection, query_vector, top_k=20, check=lambda: None, row_ids=None):
     import numpy as np
     candidates = []
     count = 0
-    cursor = connection.execute('SELECT rowid,vector FROM chunks ORDER BY rowid')
+    if row_ids is None:
+        cursor = connection.execute('SELECT rowid,vector FROM chunks ORDER BY rowid')
+    else:
+        row_ids = list(dict.fromkeys(row_ids))
+        if not 1 <= len(row_ids) <= SCAN_BATCH:
+            raise ValueError('知识包候选片段数量无效。')
+        cursor = connection.execute(
+            'SELECT rowid,vector FROM chunks WHERE rowid IN (' + ','.join('?' for _ in row_ids) + ') ORDER BY rowid',
+            row_ids)
     while True:
         check()
         rows = cursor.fetchmany(SCAN_BATCH)
@@ -35,5 +43,7 @@ def semantic_top(connection, query_vector, top_k=20, check=lambda: None):
     check()
     if not count:
         raise ValueError('知识包为空。')
+    if row_ids is not None and count != len(row_ids):
+        raise ValueError('知识包关键词索引与原文不一致。')
     ranked = sorted(candidates, reverse=True)
     return [-rowid for _, rowid in ranked], {-rowid: score for score, rowid in ranked}

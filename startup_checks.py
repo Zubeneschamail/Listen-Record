@@ -5,18 +5,35 @@ import queue
 import threading
 import time
 
-LABELS = {'model': '转录模型', 'gpu': 'GPU 加速', 'deepseek': '答疑模型'}
+LABELS = {'model': '转录模型', 'gpu': 'GPU 加速', 'qa': '答疑模型'}
 
 
 def check_local(name, report):
     from model_download import cached_model
     from model_runtime import load_model, prepare_cuda, cuda_runtime_errors
     import ctranslate2
+    from qwen_engine import QWEN_MODEL, INSTALL_HELP
 
     report('model', 'checking', f'正在检查 {name} 模型…')
     if cached_model(name) is None:
-        report('model', 'error', f'未找到完整的 {name} 模型，请下载或切换模型。')
+        report('model', 'error', INSTALL_HELP if name == QWEN_MODEL else f'未找到完整的 {name} 模型，请下载或切换模型。')
         report('gpu', 'blocked', '待转录模型就绪后验证 GPU 推理。')
+        return
+    if name == QWEN_MODEL:
+        from model_runtime import release_model
+        model = None
+        report('gpu', 'checking', '正在验证中文准确引擎的 GPU 识别与词时间戳…')
+        try:
+            model = load_model(name, device='cuda', status=lambda s: report('gpu', 'checking', s))
+            if model.model.device != 'cuda':
+                raise RuntimeError('识别引擎未使用 GPU。')
+            report('model', 'success', '中文准确模型及词时间戳模型已就绪。')
+            report('gpu', 'success', '中文准确引擎已通过 GPU 实际推理检测。')
+        except Exception as exc:
+            report('model', 'error', str(exc))
+            report('gpu', 'error', '中文准确模型需要可用的 NVIDIA GPU；也可切换 Whisper 模型。')
+        finally:
+            release_model(model)
         return
     report('gpu', 'checking', '正在检查显卡和运行库…')
     gpu_error = None
@@ -67,7 +84,7 @@ class StartupChecks:
         self.active = False
         self.started = 0
 
-    def start(self, name, profile):
+    def start(self, name, profile, provider='deepseek'):
         self.active = True
         self.started = self.clock()
         self.results = {key: ('checking', '正在检测…') for key in LABELS}
@@ -90,14 +107,14 @@ class StartupChecks:
         def network():
             from qa_provider import APIProvider
             try:
-                backend = APIProvider('deepseek', profile)
+                backend = APIProvider(provider, profile)
                 backend.check_connection(self.cancel, timeout=20)
                 result = ('success', f'{profile.get("model", "答疑模型")} 已成功响应。')
             except Exception as exc:
                 result = ('error', str(exc))
             if not self.cancel.is_set():
-                self.messages.put(('deepseek', *result))
-        threading.Thread(target=network, daemon=True, name='startup-deepseek').start()
+                self.messages.put(('qa', *result))
+        threading.Thread(target=network, daemon=True, name='startup-qa').start()
 
     def _close_local(self):
         if self.process:
@@ -132,9 +149,9 @@ class StartupChecks:
             key, state, detail = self.messages.get_nowait()
             if self.results[key][0] == 'checking':
                 self.results[key] = (state, detail)
-        if self.results['deepseek'][0] == 'checking' and self.clock() - self.started > 25:
+        if self.results['qa'][0] == 'checking' and self.clock() - self.started > 25:
             self.cancel.set()
-            self.results['deepseek'] = ('error', '答疑模型连接检测超时，请检查网络或服务配置。')
+            self.results['qa'] = ('error', '答疑模型连接检测超时，请检查网络或服务配置。')
         if all(state not in ('waiting', 'checking') for state, _ in self.results.values()):
             self.active = False
 

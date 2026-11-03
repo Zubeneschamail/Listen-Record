@@ -1,6 +1,7 @@
 """Bounded, local extractive memory; full originals remain in the session."""
 import json
 import re
+from interview_context import select_topic_history
 
 
 CONTEXT_BYTES = 36000
@@ -40,6 +41,7 @@ def terms(text):
 
 
 def build_context(rows, exchanges, question, budget=CONTEXT_BYTES):
+    rows, exchanges = select_topic_history(rows, exchanges, question)
     transcripts = [f'[转写 {i+1} / {source}] {text}' for i, (source, text) in enumerate(rows)]
     answers = [f'[问答 {i+1}] 用户问题：{q}\nAI 回复（非已确认事实）：{a}'
                for i, (q, a) in enumerate(exchanges)]
@@ -86,6 +88,7 @@ def build_context(rows, exchanges, question, budget=CONTEXT_BYTES):
 
 def build_conversation(rows, exchanges, question):
     """Keep actual user/assistant roles; summarize only older overflow turns."""
+    rows, exchanges = select_topic_history(rows, exchanges, question)
     pairs = [[{'role': 'user', 'content': q}, {'role': 'assistant', 'content': a}]
              for q, a in exchanges]
     background = {'模式': '完整会话', '全部转写':

@@ -5,7 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 from app import load_model, clean_caption
-from recognition import RecognitionContext, DEFAULT_HOTWORDS
+from recognition import RecognitionContext, LEGACY_DEFAULT_HOTWORDS
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="base")
@@ -13,7 +13,7 @@ parser.add_argument("--language", default="en", choices=["en", "zh"])
 parser.add_argument("--streaming", action="store_true")
 parser.add_argument("--force-cuts", action="store_true", help="Stress-test overlap with forced 5s cuts")
 parser.add_argument("--preview", action="store_true", help="Exercise provisional then final decoding")
-parser.add_argument("--guided", action="store_true", help="Use hotwords, recent context and adaptive final beam")
+parser.add_argument("--guided", action="store_true", help="Use example hotwords and adaptive final beam")
 args = parser.parse_args()
 
 with tempfile.TemporaryDirectory(prefix="wenlu-test-") as folder:
@@ -50,7 +50,7 @@ $stream.Close()
         final_rows, drafts = [], []
         audio_clock = [0.0]
         preview = DraftPreview(clock=lambda: audio_clock[0])
-        guidance = RecognitionContext(DEFAULT_HOTWORDS) if args.guided else None
+        guidance = RecognitionContext(LEGACY_DEFAULT_HOTWORDS) if args.guided else None
 
         def confirm(batch):
             chunks.extend(batch)

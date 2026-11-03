@@ -1,6 +1,7 @@
 """Stage official NVIDIA wheels as an optional, application-local installer component."""
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import sys
@@ -10,6 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGES = {'cublas': ('nvidia-cublas-cu12', '12.4.5.8'),
             'cuda_nvrtc': ('nvidia-cuda-nvrtc-cu12', '12.4.127'),
             'cudnn': ('nvidia-cudnn-cu12', '9.1.0.70')}
+WHEEL_SHA256 = {
+    'cublas': '5a796786da89203a0657eda402bcdcec6180254a8ac22d72213abc42069522dc',
+    'cuda_nvrtc': 'a961b2f1d5f17b14867c619ceb99ef6fcec12e46612711bcec78eb05068a60ec',
+    'cudnn': '6278562929433d68365a07a4a1546c237ba2849852c0d4b2262a486e805b977a',
+}
 REQUIRED = {'cublas64_12.dll', 'cublasLt64_12.dll', 'cudnn64_9.dll',
             'nvrtc64_120_0.dll', 'nvrtc-builtins64_124.dll',
             'cudnn_ops64_9.dll', 'cudnn_cnn64_9.dll', 'cudnn_graph64_9.dll'}
@@ -23,11 +29,16 @@ def stage():
     for component, (package, version) in PACKAGES.items():
         matches = list(wheels.glob(package.replace('-', '_') + '-' + version + '-*win_amd64.whl'))
         if not matches:
-            subprocess.run([sys.executable, '-m', 'pip', 'download', '--index-url', 'https://pypi.org/simple',
+            index = os.environ.get('WENLU_PYPI_INDEX', 'https://pypi.org/simple')
+            subprocess.run([sys.executable, '-m', 'pip', 'download', '--index-url', index,
                             '--only-binary=:all:', '--no-deps', '--dest', str(wheels), package + '==' + version], check=True)
             matches = list(wheels.glob(package.replace('-', '_') + '-' + version + '-*win_amd64.whl'))
         if len(matches) != 1:
             raise RuntimeError(f'Expected one Windows x64 wheel for {package}')
+        with matches[0].open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if digest != WHEEL_SHA256[component]:
+            raise RuntimeError(f'Hash mismatch for {matches[0].name}')
         licenses = 0
         with zipfile.ZipFile(matches[0]) as archive:
             for member in archive.namelist():

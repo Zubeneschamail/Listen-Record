@@ -64,13 +64,14 @@ class KnowledgeImportTests(unittest.TestCase):
         self.assertEqual(list(managed.parent.glob('*.backup')), [])
         self.assertEqual(len(list(managed.parent.glob('*.wlkb'))), 1)
 
-    def test_invalid_cross_customer_and_settings_draft_leave_selection_unchanged(self):
+    def test_cross_customer_import_and_invalid_import_leave_selection_unchanged(self):
         import_into_app(self.app, self.package, self.folder)
-        original = dict(self.settings)
         other = self.folder / 'other.wlkb'
         write_package(other, self.encoder, customer='other')
-        with self.assertRaisesRegex(ValueError, '不同客户'):
-            import_into_app(self.app, other, self.folder)
+        imported = import_into_app(self.app, other, self.folder)
+        self.assertEqual(len(self.settings['paths']), 2)
+        self.assertEqual(imported['customer_id'], 'other')
+        original = dict(self.settings, paths=list(self.settings['paths']))
         self.app.settings_visible = True
         with self.assertRaisesRegex(ValueError, '设置'):
             import_into_app(self.app, self.package, self.folder)

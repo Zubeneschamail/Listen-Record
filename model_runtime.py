@@ -47,6 +47,17 @@ def cuda_runtime_available():
 
 
 def load_model(name, device='auto', status=None):
+    from qwen_engine import QWEN_MODEL, INSTALL_HELP, engine_root
+    if name == QWEN_MODEL:
+        if device == 'cpu':
+            raise RuntimeError('中文准确模型需要 NVIDIA GPU；CPU 转录请选择 small 或其他 Whisper 模型。')
+        root = engine_root()
+        if root is None:
+            raise RuntimeError(INSTALL_HELP)
+        if status:
+            status('正在加载中文准确模型与词时间戳模型 · GPU…')
+        from qwen_runtime import QwenModel
+        return QwenModel(root)
     def create(target):
         options = dict(device=target, compute_type='float16' if target == 'cuda' else 'int8',
                        cpu_threads=6, num_workers=1, download_root=str(MODELS))
@@ -58,7 +69,7 @@ def load_model(name, device='auto', status=None):
             status(f'正在加载 {name} · {"GPU" if target == "cuda" else "CPU"}…')
         logging.info('Loading recognition model: %s / %s', target, name)
         model = WhisperModel(str(cached), local_files_only=True, **options)
-        # CUDA libraries are loaded lazily: actually execute before opening audio streams.
+        # CUDA libraries are lazy: validate inference before decoding queued audio.
         if status:
             status(f'正在初始化 {name} · {"GPU" if target == "cuda" else "CPU"}…')
         segments, _ = model.transcribe(np.zeros(16000, dtype=np.float32), language='zh',
@@ -82,3 +93,26 @@ def load_model(name, device='auto', status=None):
             raise
         logging.exception('GPU initialization failed; falling back to CPU')
     return create('cpu')
+
+
+def load_capture_model(name, device='auto', status=None):
+    """Capture sessions may end while their warm model remains cached."""
+    from qwen_engine import QWEN_MODEL
+    if name == QWEN_MODEL:
+        return load_model(name, device=device, status=status)
+    from whisper_runtime import WhisperCaptureModel
+    return WhisperCaptureModel(lambda: load_model(name, device=device, status=status))
+
+
+def release_model(model):
+    """Release either a native Whisper model or a separate GPU engine."""
+    if model is None:
+        return
+    close = getattr(model, 'close', None)
+    if callable(close):
+        close()
+    else:
+        backend = getattr(model, 'model', None)
+        unload = getattr(backend, 'unload_model', None)
+        if callable(unload):
+            unload()

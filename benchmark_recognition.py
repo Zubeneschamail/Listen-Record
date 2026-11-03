@@ -9,7 +9,7 @@ import time
 
 from faster_whisper.audio import decode_audio
 from app import load_model, clean_caption
-from recognition import DEFAULT_HOTWORDS, RecognitionContext
+from recognition import LEGACY_DEFAULT_HOTWORDS, RecognitionContext
 from segmentation import AudioChunk, WordAssembler, decode_chunk, RATE
 
 
@@ -52,7 +52,7 @@ def main():
                            creationflags=subprocess.CREATE_NO_WINDOW)
             audio.append(decode_audio(str(wav), sampling_rate=RATE))
         for name in ("baseline", "guided"):
-            guidance = RecognitionContext(DEFAULT_HOTWORDS) if name == "guided" else None
+            guidance = RecognitionContext(LEGACY_DEFAULT_HOTWORDS) if name == "guided" else None
             offset = 0
             for reference, sound in zip(samples, audio):
                 started = time.monotonic()

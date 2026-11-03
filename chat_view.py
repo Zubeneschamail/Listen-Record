@@ -9,9 +9,10 @@ SURFACE = "#ffffff"
 
 
 class Bubble(tk.Frame):
-    def __init__(self, parent, row, click, selected_text):
+    def __init__(self, parent, row, click, selected_text, edit=None):
         super().__init__(parent, bg=SURFACE)
         self.row, self.click, self.selected_text = row, click, selected_text
+        self.edit = edit
         self.mine = row.get("source") == "microphone"
         self.normal = "#F0F1F3" if self.mine else "#EDF4FA"
         self.label = tk.Label(self, text=row.get("time", ""),
@@ -31,11 +32,24 @@ class Bubble(tk.Frame):
         self.text.bind("<ButtonRelease-1>", self.release)
         self.canvas.bind("<ButtonPress-1>", self.press)
         self.canvas.bind("<ButtonRelease-1>", self.release)
+        if edit is not None:
+            self.menu = tk.Menu(self, tearoff=False)
+            self.menu.add_command(label='修正这段转录…', command=lambda: self.edit(self.row['id']))
+            for widget in (self.text, self.canvas, self.label):
+                widget.bind('<Button-3>', self.context_menu)
         self.draft = row.get("draft", False)
         if self.draft:
             self.text.configure(fg="#8A929C" if self.mine else "#7896AD")
         self.dark = getattr(self.winfo_toplevel(), '_dark_theme', False)
         self.apply_theme(self.dark)
+
+    def context_menu(self, event):
+        if not self.draft:
+            try:
+                self.menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.menu.grab_release()
+        return 'break'
 
     def apply_theme(self, dark):
         self.dark = dark
@@ -139,9 +153,10 @@ class Bubble(tk.Frame):
 
 class ChatView(tk.Frame):
     _custom_theme = True
-    def __init__(self, parent, click, selected_text, overlay_parent=None):
+    def __init__(self, parent, click, selected_text, overlay_parent=None, edit=None):
         super().__init__(parent, bg=SURFACE)
         self.click, self.selected_text = click, selected_text
+        self.edit = edit
         self.bubbles = {}
         self.canvas = tk.Canvas(self, bg=SURFACE, bd=0, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -218,7 +233,7 @@ class ChatView(tk.Frame):
             old.text.insert("end", row["text"])
             old.text.configure(state="disabled")
         else:
-            old = Bubble(self.inner, row, self.click, self.selected_text)
+            old = Bubble(self.inner, row, self.click, self.selected_text, self.edit)
             self.bubbles[key] = old
             old.pack(fill="x")
             for widget in (old, old.label, old.canvas, old.text):

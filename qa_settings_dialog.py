@@ -2,7 +2,7 @@
 import copy
 import tkinter as tk
 from tkinter import ttk, messagebox
-from desktop_dialogs import dialog
+from desktop_dialogs import dialog, restore_dialog_focus
 from qa_provider import DEFAULTS, PROVIDERS, endpoint, save_settings
 from ui_components import guard_combo_wheel
 
@@ -12,6 +12,7 @@ def show(app, initial_provider=None, on_close=None, initial_error=None):
     if existing is not None and existing.winfo_exists():
         existing.lift()
         return existing
+    previous_focus = app.root.focus_get()
     window = dialog(app, '闻录 · 模型服务')
     app.qa_settings_window = window
     window.transient(app.settings_window)
@@ -62,15 +63,15 @@ def show(app, initial_provider=None, on_close=None, initial_error=None):
         active[0] = next(name for name, label in PROVIDERS.items() if label == provider.get())
         populate()
 
-    def close():
+    def close(event=None):
         key.set('')
         drafts.clear()
         window.grab_release()
+        restore_dialog_focus(app, previous_focus)
         window.destroy()
-        if app.settings_window.winfo_viewable():
-            app.settings_window.grab_set()
         if on_close:
             app.root.after_idle(on_close)
+        return 'break'
 
     def save():
         stash()
@@ -99,6 +100,7 @@ def show(app, initial_provider=None, on_close=None, initial_error=None):
     ttk.Button(actions, text='取消', command=close).pack(side='left', padx=(0, 8))
     ttk.Button(actions, text='保存', command=save).pack(side='left')
     window.protocol('WM_DELETE_WINDOW', close)
+    window.bind('<Escape>', close)
     populate()
     if initial_error:
         help_text.set('启动检测未通过：' + initial_error[:300] + '\n请检查服务配置并保存，再重新检测。')

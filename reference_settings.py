@@ -1,5 +1,7 @@
 """Reference material controls embedded in the shared settings viewport."""
+from concurrent.futures import Future
 from pathlib import Path
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
@@ -160,6 +162,7 @@ def build(app, parent):
     count = tk.StringVar()
     notice = tk.StringVar()
     selected_path = tk.StringVar(value='添加与你讨论的问题相关的文档或项目目录。')
+    pending_add = None
     ttk.Checkbutton(heading, text='回答时查阅参考资料', variable=enabled,
                     command=lambda: commit(list(settings['paths']))).pack(side='left')
     ui.note(heading, variable=count).pack(side='right')
@@ -194,7 +197,7 @@ def build(app, parent):
         provider_changed()
 
     def provider_changed(*_):
-        notice.set('知识包会先在本机检索；普通文件由 DeepSeek 按需查阅。'
+        notice.set('知识包会先在本机检索；个人经历问题会预读简历，其他普通文件由 DeepSeek 按需查阅。'
                    if app.qa_settings['provider'] == 'deepseek' else
                    '兼容 API 支持知识包检索；普通文件查阅仍需 DeepSeek。')
 
@@ -208,7 +211,7 @@ def build(app, parent):
         except OSError:
             enabled.set(settings['enabled'])
             messagebox.showerror('保存失败', '无法保存参考资料设置，请检查磁盘权限或空间。', parent=dialog_parent())
-            return
+            return False
         settings.update(updated)
         if not app.settings_visible:
             app.qa.reset()
@@ -217,6 +220,7 @@ def build(app, parent):
             if changed_knowledge:
                 app.reset_knowledge_context()
         refresh()
+        return True
 
     def snapshot():
         return {'enabled': enabled.get(), 'paths': list(settings['paths'])}
@@ -238,10 +242,8 @@ def build(app, parent):
         # Even replacing the same managed path may contain a newer package revision.
         app.reset_knowledge_context()
 
-    def add(values):
-        if not values:
-            return
-        paths = list(settings['paths'])
+    def prepare_add(values, initial_paths):
+        paths = list(initial_paths)
         errors = []
         for value in values:
             try:
@@ -255,11 +257,74 @@ def build(app, parent):
                     paths.append(value)
             except (OSError, ValueError) as exc:
                 errors.append(f'{Path(value).name}：{str(exc) if isinstance(exc, ValueError) else "路径不可访问"}')
+        return paths, errors
+
+    def apply_add(paths, errors):
         if paths != settings['paths']:
             enabled.set(True)
-            commit(paths)
+            if not commit(paths):
+                return False
         if errors:
             messagebox.showwarning('部分资料未添加', '\n'.join(errors[:5]), parent=dialog_parent())
+        return True
+
+    def add(values):
+        nonlocal pending_add
+        if not values:
+            return
+        if pending_add is not None:
+            selected_path.set('正在校验知识包，请等待当前添加完成。')
+            return
+        values = tuple(values)
+        if not any(Path(value).suffix.lower() == '.wlkb' for value in values):
+            apply_add(*prepare_add(values, settings['paths']))
+            return
+
+        # SQLite validation may scan gigabytes. Keep every Tk call on the UI thread.
+        original = list(settings['paths'])
+        future = Future()
+        pending_add = future
+        selected_path.set('正在后台校验知识包，界面仍可使用…')
+        app.qa_status.set('正在校验知识包，完成后会自动添加…')
+
+        def run():
+            try:
+                future.set_result(prepare_add(values, original))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        def finish():
+            nonlocal pending_add
+            if getattr(app, 'closing', False) or not app.root.winfo_exists():
+                pending_add = None
+                return
+            if not future.done():
+                app.root.after(100, finish)
+                return
+            pending_add = None
+            try:
+                paths, errors = future.result()
+                if settings['paths'] != original:
+                    raise ValueError('校验期间资料列表发生变化，请重新添加知识包。')
+                if not apply_add(paths, errors):
+                    selected_path.set('知识包添加失败：无法保存资料设置。')
+                    app.qa_status.set('知识包添加失败：无法保存资料设置。')
+                    return
+                if errors:
+                    selected_path.set('部分资料未添加，请查看提示。')
+                    app.qa_status.set('部分资料未添加，请查看提示。')
+                elif paths == original:
+                    selected_path.set('所选知识包已经在资料列表中。')
+                    app.qa_status.set('所选知识包已经在资料列表中。')
+                else:
+                    selected_path.set('知识包已添加，可以在资料列表中查看。')
+                    app.qa_status.set('知识包已添加，可以开始问答。')
+            except Exception as exc:
+                app.qa_status.set('知识包添加失败：' + str(exc))
+                messagebox.showerror('知识包添加失败', str(exc), parent=dialog_parent())
+
+        threading.Thread(target=run, daemon=True).start()
+        app.root.after(100, finish)
 
     def add_files():
         add(filedialog.askopenfilenames(parent=dialog_parent(), title='添加参考文件',
@@ -297,7 +362,7 @@ def build(app, parent):
     listing.bind('<<ListboxSelect>>', selection)
     ui.note(parent, variable=notice).pack(fill='x', pady=(16, 6))
     ui.note(parent, '支持 .wlkb、文本、代码、PDF、DOCX；相关片段会发送给模型。\n'
-            '同一时间仅添加同一客户的知识包，最多 4 个。').pack(fill='x')
+            '可添加不同客户的知识包，最多同时启用 4 个。').pack(fill='x')
     app.qa_provider_name.trace_add('write', provider_changed)
     # Named controls support UI verification without touching personal files.
     app.reference_controls = dict(listing=listing, enabled=enabled, add=add, remove=remove,

@@ -3,10 +3,11 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import httpx
 from qa_worker import make_prompt
 from qa_provider import APIProvider
-from reference_policy import requires_reference_tools, promises_reference_read
+from reference_policy import asks_about_personal_experience, requires_reference_tools, promises_reference_read
 
 
 def chunk(delta, finish=None):
@@ -14,6 +15,37 @@ def chunk(delta, finish=None):
 
 
 class ReferenceProviderTests(unittest.TestCase):
+    def test_personal_question_reads_resume_even_alongside_knowledge_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resume = Path(directory) / 'uploaded.txt'
+            resume.write_text('联系方式：仅本地保留\n视客全栈开发方向\n工作经历\n视客：负责客户订单中台的全栈开发，'
+                              '前端使用 Vue，后端使用 Java。\n项目经历\n独立实现订单查询。\n教育经历\n本科。',
+                              encoding='utf-8')
+            requests = []
+            def handler(request):
+                body = json.loads(request.content)
+                requests.append(body)
+                content = body['messages'][-1]['content']
+                self.assertIn('[本轮简历资料]', content)
+                self.assertIn('视客全栈开发方向', content)
+                self.assertIn('视客：负责客户订单中台的全栈开发', content)
+                self.assertNotIn('联系方式：仅本地保留', content)
+                self.assertIn('其他客户项目', content)
+                return httpx.Response(200, text=chunk({'content': '我在视客负责订单中台的全栈开发。'}, 'stop'))
+            backend = APIProvider('deepseek', dict(base_url='https://example.com', model='test', api_key='fake'),
+                httpx.MockTransport(handler), lambda: {'enabled': True,
+                    'paths': [str(Path(directory) / 'other.wlkb'), str(resume)]})
+            with patch('knowledge_packages.KnowledgeLibrary.context', return_value='其他客户项目'):
+                answer = backend.run(make_prompt('', '简单说下你在视客的全栈开发工作经历'), threading.Event())
+            self.assertIn('视客', answer)
+            self.assertEqual(len(requests), 1)
+
+    def test_resume_context_uses_current_question_and_respects_no_reference(self):
+        self.assertTrue(asks_about_personal_experience(make_prompt('', '简单说下你在视客的全栈开发工作经历')))
+        self.assertFalse(asks_about_personal_experience(make_prompt('说说工作经历', '解释一下事务隔离')))
+        self.assertFalse(asks_about_personal_experience(make_prompt('', '不用参考简历，解释一下事务隔离')))
+        self.assertFalse(asks_about_personal_experience(make_prompt('', '我在调试时遇到超时，应该怎么排查？')))
+
     def test_read_request_and_followup_require_real_tools_before_answer(self):
         for question, history in (
                 ('读取 spec.txt 的内容', []),

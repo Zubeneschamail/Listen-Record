@@ -21,6 +21,9 @@ def complete_model(path):
 
 
 def cached_model(name):
+    from qwen_engine import QWEN_MODEL, engine_root
+    if name == QWEN_MODEL:
+        return engine_root()
     from faster_whisper.utils import _MODELS
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
@@ -45,6 +48,13 @@ def cached_model(name):
 
 def download_worker(name, pipe):
     """Spawned process: closing the dialog can stop network waits immediately."""
+    from qwen_engine import QWEN_MODEL, INSTALL_HELP
+    if name == QWEN_MODEL:
+        try:
+            pipe.send(('error', INSTALL_HELP))
+        finally:
+            pipe.close()
+        return
     import io
     import logging
     import time

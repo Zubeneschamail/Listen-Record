@@ -125,6 +125,52 @@ class ReferenceTools:
         return [{'root': key, 'name': path.name, 'kind': 'folder' if path.is_dir() else 'file'}
                 for key, path in self.roots.items()]
 
+    def personal_context(self, prompt):
+        """Read a selected resume locally before a personal-experience answer."""
+        from reference_policy import asks_about_personal_experience, current_question
+        if not asks_about_personal_experience(prompt):
+            return ''
+        question = current_question(prompt)
+        terms = {group[i:i+2] for group in re.findall(r'[\u3400-\u9fff]+', question)
+                 for i in range(len(group)-1)}
+        terms.update(re.findall(r'[a-zA-Z][a-zA-Z0-9+#.]{1,}', question.lower()))
+        terms -= {'简单', '说下', '说说', '介绍', '一下', '自己', '你在', '工作',
+                  '经历', '开发', '项目', '什么', '哪些', '怎么', '如何'}
+        self.deadline = time.monotonic() + 5
+        for key, path in self.roots.items():
+            if not path.is_file() or path.suffix.lower() not in {'.pdf', '.docx', '.txt', '.md'}:
+                continue
+            virtual = f'{key}/{path.name}'
+            try:
+                lines = self.lines(self.resolve(virtual))
+            except RuntimeError:
+                raise
+            except Exception:
+                continue  # The normal reference tools can still report read errors.
+            text = '\n'.join(lines)
+            markers = sum(bool(re.search(pattern, text, re.I)) for pattern in (
+                r'工作经历|工作经验|work experience|employment history',
+                r'项目经历|项目经验|projects?',
+                r'教育经历|学历|education|专业技能|technical skills'))
+            if markers < 2 and not re.search(r'简历|履历|resume|\bcv\b', path.stem, re.I):
+                continue
+            start = next((i for i, line in enumerate(lines) if re.search(
+                r'工作经历|工作经验|项目经历|项目经验|教育经历|专业技能|work experience|employment history',
+                line, re.I)), 0)
+            def private_line(line):
+                return bool(re.search(r'电话|手机|邮箱|身份证|期望薪资|薪资|(?:现居|家庭)地址|'
+                                      r'微信(?:号|[：:])|\b(?:email|phone)\b|'
+                                      r'[\w.+-]+@[\w.-]+|(?<!\d)1[3-9]\d{9}(?!\d)', line, re.I))
+            prefix = [(i, line) for i, line in enumerate(lines[:start])
+                      if any(term in line.lower() for term in terms)
+                      and not private_line(line)]
+            excerpt = '\n'.join(f'{i+1}: {line}' for i, line in prefix + list(enumerate(lines[start:], start))
+                                if line.strip() and not private_line(line))
+            if excerpt:
+                return json.dumps({'来源': virtual, '原文': excerpt[:9000],
+                                   '截断': len(excerpt) > 9000}, ensure_ascii=False)
+        return ''
+
     def check(self):
         if self.cancel.is_set():
             raise RuntimeError('已取消')

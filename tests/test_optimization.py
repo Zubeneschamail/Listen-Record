@@ -35,11 +35,19 @@ class OptimizationTests(unittest.TestCase):
         self.assertNotIn('=', context.options(0)['hotwords'])
         self.assertEqual(RecognitionContext('大模型').normalize('大模形'), '大模形')
 
-    def test_long_phrase_can_finalize_on_short_pause_without_cutting_speech(self):
-        chunks = feed(PauseSegmenter(detector), np.r_[np.ones(7*RATE), np.zeros(int(.4*RATE))].astype(np.float32))
+    def test_long_phrase_confirms_pause_then_finalizes_without_cutting_speech(self):
+        segmenter = PauseSegmenter(detector)
+        signal = np.r_[np.ones(7*RATE), np.zeros(int(.4*RATE))].astype(np.float32)
+        self.assertEqual(feed(segmenter, signal), [])
+        chunks = segmenter.push(np.zeros(int(.4*RATE), dtype=np.float32), 7.4, 1007.4)
         self.assertEqual(len(chunks), 1)
         self.assertFalse(chunks[0].forced)
         self.assertAlmostEqual(len(chunks[0].audio)/RATE, 7.2)
+        self.assertAlmostEqual(chunks[0].start, 0.)
+        self.assertAlmostEqual(chunks[0].epoch, 1000.)
+        np.testing.assert_array_equal(chunks[0].audio,
+            np.r_[np.ones(7*RATE), np.zeros(int(.2*RATE))].astype(np.float32))
+        self.assertEqual(segmenter.finish(), [])
         self.assertFalse(feed(PauseSegmenter(detector), np.ones(9*RATE, dtype=np.float32)))
 
     def test_final_keeps_search_quality_during_small_backlog(self):

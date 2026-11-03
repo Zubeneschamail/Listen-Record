@@ -10,6 +10,35 @@ from app import App
 
 
 class WindowFlowTests(unittest.TestCase):
+    def test_save_failure_stops_capture_and_keeps_text_available_to_export(self):
+        with patch('app.GlobalHotkey'):
+            root = tk.Tk()
+            app = App(root)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                app.session = Path(folder)/'session.jsonl'
+                row = dict(start=0, end=1, text='保存失败时这段文字仍可以手动导出。')
+                with patch('app.save_segment', side_effect=OSError('disk full')), \
+                        patch.object(app.engine, 'stop') as stop:
+                    app.events.put(('segment', row))
+                    app.poll()
+                    stop.assert_called_once()
+                self.assertTrue(app.failed)
+                self.assertEqual(app.rows, [row])
+                self.assertIn(row['text'], app.text.get('1.0', 'end'))
+                app.events.put(('done', None))
+                app.poll()
+                self.assertIn('自动保存失败', app.status.get())
+                self.assertNotIn('已停止', app.status.get())
+        finally:
+            app.qa_connection.close()
+            app.qa.set_enabled(False)
+            app.hotkey.close()
+            for identifier in root.tk.call('after', 'info'):
+                root.after_cancel(identifier)
+            root.destroy()
+
     def test_restore_long_conversation_reflows_scroll_region(self):
         with patch('app.GlobalHotkey'):
             root = tk.Tk()
@@ -231,13 +260,13 @@ class WindowFlowTests(unittest.TestCase):
             app.toggle_settings()
             root.update()
             self.assertEqual(app.model.current(), 1)
-            self.assertEqual(app.hotwords.get(), "大模型,闻录")
+            self.assertEqual(app.hotwords.get(), "大模型, 闻录")  # Canonical saved separator.
             app.settings_tabs.select(app.settings_pages['tools'])
             root.update()
             self.assertEqual(app.settings_window.winfo_height(), 440)
             tools_page = app.settings_pages['tools']
             self.assertEqual(tools_page.canvas.yview()[0], 0)
-            self.assertEqual(set(app.settings_actions), {'导出记录', '历史记录', '关于与更新'})
+            self.assertEqual(set(app.settings_actions), {'导出记录', '保存问答副本', '打开练习', '历史记录', '关于与更新'})
             for action in app.settings_actions.values():
                 self.assertTrue(action.winfo_viewable())
             with patch.object(app, 'open_folder') as folder:

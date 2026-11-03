@@ -5,6 +5,30 @@ from faster_whisper import WhisperModel
 from segmentation import budget_prompt
 
 class PromptBudgetTests(unittest.TestCase):
+    def make_character_model(self, max_length):
+        tokenizer = Tokenizer(models.WordLevel({'[UNK]': 0}, unk_token='[UNK]'))
+        tokenizer.pre_tokenizer = pre_tokenizers.Split('', behavior='isolated')
+        return SimpleNamespace(hf_tokenizer=tokenizer, max_length=max_length)
+
+    def test_overflow_keeps_whole_technical_names(self):
+        model = self.make_character_model(285)  # 21 input tokens after output/control reserve.
+        original = dict(hotwords='LangGraph, PostgreSQL', beam_size=3)
+        result = budget_prompt(model, original)
+        self.assertEqual(result['hotwords'], 'LangGraph')
+        self.assertEqual(original['hotwords'], 'LangGraph, PostgreSQL')
+        self.assertEqual(result['beam_size'], 3)
+
+    def test_oversized_single_name_and_zero_budget_do_not_emit_fragments(self):
+        for maximum in (264, 270):
+            with self.subTest(maximum=maximum):
+                model = self.make_character_model(maximum)
+                self.assertIsNone(budget_prompt(model, {'hotwords': 'PostgreSQL'})['hotwords'])
+
+    def test_user_priority_and_symbol_spelling_survive_trimming(self):
+        model = self.make_character_model(281)
+        result = budget_prompt(model, dict(hotwords='C++, C#, .NET, PostgreSQL'))
+        self.assertEqual(result['hotwords'], 'C++, C#, .NET')
+
     def test_combined_hotwords_and_history_leave_room_for_output(self):
         tokenizer = Tokenizer(models.WordLevel({'[UNK]': 0}, unk_token='[UNK]'))
         tokenizer.pre_tokenizer = pre_tokenizers.Split('', behavior='isolated')

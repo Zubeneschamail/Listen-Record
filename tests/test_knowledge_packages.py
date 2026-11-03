@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 import tkinter as tk
 import unittest
 from unittest.mock import patch
@@ -140,18 +141,31 @@ class KnowledgeTests(unittest.TestCase):
         with patch('knowledge_packages.KnowledgeLibrary.context', side_effect=AssertionError('probe accessed package')):
             self.assertEqual(self.provider(handler).check_connection(threading.Event()), 'OK')
 
-    def test_corrupt_and_cross_customer_rejected(self):
+    def test_cross_customer_packages_keep_separate_attribution(self):
         other = self.folder / 'other.wlkb'
-        write_package(other, self.encoder, customer='other-customer')
-        with self.assertRaisesRegex(ValueError, '不同客户'):
-            kb.validate_selection([str(self.path), str(other)])
+        write_package(other, self.encoder, customer='other-customer', text='订单失败后人工告警并重试。')
+        kb.validate_selection([str(self.path), str(other)])
         self.settings['paths'].append(str(other))
-        with self.assertRaisesRegex(RuntimeError, '客户身份'):
-            kb.KnowledgeLibrary().context(self.settings, '故障', [], threading.Event())
+        result = json.loads(kb.KnowledgeLibrary().context(self.settings, '故障如何处理', [], threading.Event()))
+        self.assertEqual({item['客户'] for item in result['片段']}, {'test-customer', 'other-customer'})
+        self.assertTrue(all(item['知识包'] == '回归测试资料' for item in result['片段']))
+        self.assertTrue(all(('other-customer' if 'other.wlkb' in item['来源'] else 'test-customer') == item['客户']
+                            for item in result['片段']))
+
+    def test_corrupt_package_and_silent_customer_change_rejected(self):
         broken = self.folder / 'broken.wlkb'
         broken.write_text('not SQLite', encoding='utf-8')
         with self.assertRaises(ValueError):
             validate_source(broken)
+        library = kb.KnowledgeLibrary()
+        library.context(self.settings, '故障', [], threading.Event())
+        with closing(sqlite3.connect(self.path)) as connection:
+            manifest = kb.inspect_package(self.path)
+            manifest['customer_id'] = 'replacement-customer'
+            connection.execute('UPDATE metadata SET value=? WHERE key=?', (json.dumps(manifest), 'manifest'))
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, '客户身份发生变化'):
+            library.context(self.settings, '故障', [], threading.Event())
 
     def test_source_paths_never_escape_and_bad_model_rejected(self):
         malicious = self.folder / 'bad.wlkb'
@@ -209,6 +223,8 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_settings_import_save_and_context_boundary(self):
         from app import App
+        other = self.folder / 'other.wlkb'
+        write_package(other, self.encoder, customer='other-customer')
         with patch('app.GlobalHotkey'), patch('app.App.start_tray'), patch('qa_connection.QAConnection.check'), \
                 patch('reference_settings.load_settings', return_value={'enabled': False, 'paths': []}), \
                 patch('reference_settings.save_settings') as save:
@@ -218,11 +234,17 @@ class KnowledgeTests(unittest.TestCase):
             try:
                 app.qa_history.append(('旧客户问题', '旧客户答案'))
                 app.rows.append({'source': 'system', 'text': '旧客户转写'})
-                with patch('reference_settings.filedialog.askopenfilenames', return_value=(str(self.path),)) as picker:
+                with patch('reference_settings.filedialog.askopenfilenames',
+                           return_value=(str(self.path), str(other))) as picker:
                     app.reference_controls['add_packages']()
+                deadline = time.monotonic() + 10
+                while not save.called:
+                    self.assertLess(time.monotonic(), deadline)
+                    root.update()
+                    time.sleep(.01)
                 self.assertEqual(picker.call_args.kwargs['filetypes'], [('闻录知识包', '*.wlkb')])
                 self.assertIn('知识包', app.reference_controls['listing'].get(0))
-                self.assertEqual(save.call_args.args[0]['paths'], [str(self.path.resolve())])
+                self.assertEqual(save.call_args.args[0]['paths'], [str(self.path.resolve()), str(other.resolve())])
                 app.auto_qa.set(True)
                 self.assertEqual(app.session_context_snapshot(), ([], []))
                 self.assertEqual(len(app.qa_history), 1)  # Visible history retained.

@@ -38,6 +38,18 @@ class AudioAndExportTests(unittest.TestCase):
         self.assertEqual(timestamp(-1, True), "00:00:00,000")
         self.assertEqual(timestamp(3661.234, True), "01:01:01,234")
 
+    def test_inverted_stereo_does_not_cancel_speech(self):
+        tone = np.sin(np.arange(1600, dtype=np.float32) * .1) * .2
+        for right in (-tone, -.9 * tone):
+            result = mono_16k(np.column_stack([tone, right]), 16000)
+            np.testing.assert_allclose(result, tone, atol=1e-6)
+
+    def test_independent_stereo_preserves_both_channels(self):
+        t = np.arange(1600, dtype=np.float32) / 16000
+        left, right = np.sin(2*np.pi*300*t), np.sin(2*np.pi*700*t)
+        result = mono_16k(np.column_stack([left, right]), 16000)
+        np.testing.assert_allclose(result, (left + right)/2, atol=1e-6)
+
     def test_export_keeps_unicode_and_segment_timing(self):
         rows = [{"start": 1.25, "end": 3.75, "text": "你好，世界。"}]
         self.assertEqual(export_text(rows, True),

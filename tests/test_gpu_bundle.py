@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ class GPUBundleTests(unittest.TestCase):
     def wheels(self, root, omit=None):
         directory = root / 'build/gpu-wheels'
         directory.mkdir(parents=True)
+        hashes = {}
         for component, (package, version) in bundle.PACKAGES.items():
             path = directory / f'{package.replace("-", "_")}-{version}-py3-none-win_amd64.whl'
             with zipfile.ZipFile(path, 'w') as archive:
@@ -23,12 +25,16 @@ class GPUBundleTests(unittest.TestCase):
                         archive.writestr(f'nvidia/{component}/bin/{name}', b'test-dll')
                 archive.writestr(package + '.dist-info/LICENSE.txt', 'NVIDIA license fixture')
                 archive.writestr(f'nvidia/{component}/bin/../../escape.dll', 'ignored')
+            with path.open('rb') as stream:
+                hashes[component] = hashlib.file_digest(stream, 'sha256').hexdigest()
+        return hashes
 
     def test_stages_dlls_and_licenses_without_installing_python_packages(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.wheels(root)
-            with patch.object(bundle, 'ROOT', root), patch.object(bundle.subprocess, 'run') as run:
+            hashes = self.wheels(root)
+            with patch.object(bundle, 'ROOT', root), patch.object(bundle, 'WHEEL_SHA256', hashes), \
+                    patch.object(bundle.subprocess, 'run') as run:
                 bundle.stage()
                 run.assert_not_called()
             output = root / 'build/gpu-runtime'
@@ -44,7 +50,16 @@ class GPUBundleTests(unittest.TestCase):
         for missing in ('cudnn64_9.dll', 'nvrtc64_120_0.dll', 'nvrtc-builtins64_124.dll'):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                self.wheels(root, omit=missing)
-                with patch.object(bundle, 'ROOT', root):
+                hashes = self.wheels(root, omit=missing)
+                with patch.object(bundle, 'ROOT', root), patch.object(bundle, 'WHEEL_SHA256', hashes):
                     with self.assertRaisesRegex(RuntimeError, 'incomplete'):
                         bundle.stage()
+
+    def test_hash_mismatch_blocks_the_installer_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hashes = self.wheels(root)
+            hashes['cudnn'] = '0' * 64
+            with patch.object(bundle, 'ROOT', root), patch.object(bundle, 'WHEEL_SHA256', hashes):
+                with self.assertRaisesRegex(RuntimeError, 'Hash mismatch'):
+                    bundle.stage()

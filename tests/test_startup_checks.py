@@ -61,7 +61,7 @@ class StartupSchedulerTests(unittest.TestCase):
                 check.start('small', DEFAULTS['deepseek'])
                 clock[0] = 26
                 check.poll()
-                self.assertEqual(check.results['deepseek'][0], 'error')
+                self.assertEqual(check.results['qa'][0], 'error')
                 context.Process.return_value.is_alive.return_value = False
                 check.poll()
                 self.assertFalse(check.active)
@@ -80,7 +80,7 @@ class StartupSchedulerTests(unittest.TestCase):
             clock[0] = 121
             check.poll()
             self.assertFalse(check.active)
-            self.assertEqual(check.results['deepseek'][0], 'success')
+            self.assertEqual(check.results['qa'][0], 'success')
             self.assertEqual(check.results['model'][0], 'error')
             context.Process.return_value.terminate.assert_called_once()
 
@@ -95,6 +95,19 @@ class StartupSchedulerTests(unittest.TestCase):
         self.assertEqual(requests[0]['max_tokens'], 8)
         self.assertEqual(requests[0]['messages'], [{'role':'user', 'content':'只回复 OK。'}])
         self.assertNotIn('tools', requests[0])
+
+    def test_selected_service_and_profile_snapshot_are_used_for_startup_probe(self):
+        check, context, receiver, clock = self.setup_check()
+        profile = dict(base_url='http://127.0.0.1:12345/v1', model='local-model', api_key='fake')
+        with patch('startup_checks.threading.Thread') as thread, patch('qa_provider.APIProvider') as provider:
+            check.start('small', profile, 'compatible')
+            profile['base_url'] = 'https://changed.invalid'
+            thread.call_args.kwargs['target']()
+            provider.assert_called_once_with('compatible', {
+                'base_url': 'http://127.0.0.1:12345/v1', 'model': 'local-model', 'api_key': 'fake'})
+            provider.return_value.check_connection.assert_called_once_with(check.cancel, timeout=20)
+            self.assertEqual(check.messages.get_nowait()[0:2], ('qa', 'success'))
+        check.close()
 
 
 class StartupUITests(unittest.TestCase):
@@ -133,7 +146,7 @@ class StartupUITests(unittest.TestCase):
         return fake
 
     def test_overlay_covers_window_blocks_recording_and_success_cleans_up(self):
-        fake = self.start_with({key:('success','正常') for key in ('model','gpu','deepseek')})
+        fake = self.start_with({key:('success','正常') for key in ('model','gpu','qa')})
         self.root.update()
         overlay = self.app.startup_overlay
         self.assertEqual(overlay.winfo_width(), self.root.winfo_width())
@@ -152,9 +165,30 @@ class StartupUITests(unittest.TestCase):
         self.assertIsNone(self.root.grab_current())
         self.assertFalse(self.app.settings_visible)
 
-    def test_errors_open_model_gpu_then_deepseek_without_changing_provider(self):
+    def test_begin_checks_selected_compatible_service(self):
         self.app.qa_settings['provider'] = 'compatible'
-        fake = self.start_with({key:('error',key+' unavailable') for key in ('model','gpu','deepseek')})
+        profile = dict(base_url='http://127.0.0.1:12345/v1', model='local-model', api_key='fake')
+        self.app.qa_settings['profiles']['compatible'] = profile
+        fake = self.start_with({key:('checking','等待') for key in ('model','gpu','qa')})
+        self.assertEqual(fake.start.call_args.args[1:], (profile, 'compatible'))
+        self.assertEqual(self.app.startup_provider, 'compatible')
+
+    def test_obsolete_service_failure_does_not_open_configuration_or_replace_status(self):
+        self.app.qa_settings['provider'] = 'deepseek'
+        fake = self.start_with({'model':('success','OK'), 'gpu':('success','OK'),
+                                'qa':('error','old service failed')})
+        self.app.qa_settings['provider'] = 'compatible'
+        fake.active = False
+        with patch('qa_settings_dialog.show') as show, patch.object(self.app.qa_connection, 'record') as record:
+            self.app.poll()
+            self.root.update()
+            show.assert_not_called()
+            record.assert_not_called()
+        self.assertFalse(self.app.settings_visible)
+
+    def test_errors_open_model_gpu_then_selected_provider(self):
+        self.app.qa_settings['provider'] = 'compatible'
+        fake = self.start_with({key:('error',key+' unavailable') for key in ('model','gpu','qa')})
         with patch('desktop_dialogs.model_manager') as manager, patch('qa_settings_dialog.show') as show:
             fake.active = False
             self.app.poll()
@@ -164,12 +198,12 @@ class StartupUITests(unittest.TestCase):
             self.assertEqual(self.app.settings_tabs.select(), str(self.app.settings_pages['audio']))
             self.app.hide_settings()
             self.root.update()
-            self.assertEqual(show.call_args.kwargs['initial_provider'], 'deepseek')
+            self.assertEqual(show.call_args.kwargs['initial_provider'], 'compatible')
             self.assertEqual(self.app.qa_settings['provider'], 'compatible')
             self.assertEqual(self.app.startup_pending_issues, [])
 
     def test_loading_surface_and_children_drag_without_interrupting_checks(self):
-        fake = self.start_with({key:('checking','等待') for key in ('model','gpu','deepseek')})
+        fake = self.start_with({key:('checking','等待') for key in ('model','gpu','qa')})
         self.root.geometry('560x380+100+100')
         self.root.update()
         overlay = self.app.startup_overlay
@@ -194,7 +228,7 @@ class StartupUITests(unittest.TestCase):
         self.assertFalse(close.bind('<B1-Motion>'))
 
     def test_deepseek_only_failure_automatically_opens_its_configuration(self):
-        fake = self.start_with({'model':('success','OK'),'gpu':('success','OK'),'deepseek':('error','API Key 无效')})
+        fake = self.start_with({'model':('success','OK'),'gpu':('success','OK'),'qa':('error','API Key 无效')})
         fake.active = False
         self.app.poll()
         self.root.update()
@@ -204,7 +238,7 @@ class StartupUITests(unittest.TestCase):
         self.assertEqual(self.app.settings_tabs.select(), str(self.app.settings_pages['ai']))
 
     def test_close_cancels_workers_and_animation(self):
-        fake = self.start_with({key:('checking','等待') for key in ('model','gpu','deepseek')})
+        fake = self.start_with({key:('checking','等待') for key in ('model','gpu','qa')})
         with patch.object(self.root, 'destroy'):
             self.app.close()
         fake.close.assert_called_once()

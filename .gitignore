@@ -18,3 +18,20 @@ release/
 
 # Local knowledge-base demo materials; not part of release inputs.
 /artifacts/knowledge-demo/
+
+# Local credentials, user settings, knowledge packages and evaluation output.
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.wlkb
+*.wenlukb
+/artifacts/
+/knowledge-packages/
+/customer-delivery/
+/qa-settings.json
+/reference-settings.json
+/desktop-settings.json
+/credentials.json
+/secrets.json

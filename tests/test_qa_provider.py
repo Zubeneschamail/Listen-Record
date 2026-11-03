@@ -9,7 +9,7 @@ import unittest
 
 import httpx
 from qa_worker import QAWorker, make_prompt
-from qa_provider import APIProvider, endpoint, load_settings, save_settings
+from qa_provider import APIProvider, DEFAULTS, endpoint, load_settings, save_settings
 
 
 def event(content='', finish=None):
@@ -83,6 +83,13 @@ class ProviderTests(unittest.TestCase):
         for url in ('http://example.com', 'https://user:key@example.com', 'https://example.com?a=key', ''):
             with self.assertRaises(ValueError):
                 endpoint(url)
+
+    def test_missing_settings_include_default_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = load_settings(Path(directory) / 'missing.json')
+        self.assertEqual(settings['provider'], 'deepseek')
+        for name, defaults in DEFAULTS.items():
+            self.assertEqual(settings['profiles'][name], dict(defaults, api_key=''))
 
     def test_credentials_roundtrip_encrypted_and_profiles_are_separate(self):
         settings = {'provider': 'deepseek', 'profiles': {

@@ -403,7 +403,7 @@ class ClipboardAppTests(unittest.TestCase):
         self.app.toggle_auto_qa()
         self.app.rows = [{'text': '录音背景'}]
         self.app.qa.feed('语音问题是什么？')
-        self.app.qa.last_input -= 2
+        self.app.qa.pending['system'].updated -= 2
         self.enable()
         self.assertTrue(self.app.auto_qa.get())
         received = []
@@ -413,10 +413,10 @@ class ClipboardAppTests(unittest.TestCase):
         self.enqueue(ClipboardItem('继续'))
         self.app.send_pending_clipboard()
         self.app.qa.feed('再补充一个问题？')
-        self.app.qa.last_input -= 2
+        self.app.qa.pending['system'].updated -= 2
         self.finish()
         self.assertNotIn('录音背景', received[0][0])
-        self.assertEqual(self.app.qa.pending, ['语音问题是什么？', '再补充一个问题？'])
+        self.assertEqual(self.app.qa.pending['system'].parts, ['语音问题是什么？', '再补充一个问题？'])
         self.app.poll()  # Ready voice gets a turn before the next clipboard copy.
         self.assertEqual(self.app.qa.source, 'auto')
         self.finish()

@@ -84,7 +84,7 @@ class AutoQATests(unittest.TestCase):
                 app.qa.feed('什么是大模型？')
                 app.qa.tick()
                 self.assertFalse(app.qa.active)
-                app.qa.last_input -= 2
+                app.qa.pending['system'].updated -= 2
                 app.qa.tick()
                 # Consume the worker events without running recording poll timers.
                 states = []
@@ -100,7 +100,7 @@ class AutoQATests(unittest.TestCase):
                 self.assertEqual(app.session_context_snapshot()[1], [('什么是大模型？', '示例答案')])
                 self.assertNotIn('旧问题', payload['当前问题'])
                 app.qa.feed('什么是大模型？')
-                app.qa.last_input -= 2
+                app.qa.pending['system'].updated -= 2
                 app.qa.tick()
                 self.assertFalse(app.qa.active)
                 generation = app.qa.generation

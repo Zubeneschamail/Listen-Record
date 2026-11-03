@@ -17,6 +17,13 @@ class LevelTests(unittest.TestCase):
             audio = np.full(1600, level, dtype=np.float32)
             np.testing.assert_array_equal(AudioLevelNormalizer().process(audio), audio)
 
+    def test_microphone_gain_is_capped_below_loopback_gain(self):
+        quiet = np.full(1600, .0005, dtype=np.float32)
+        microphone = AudioLevelNormalizer(max_gain=4.).process(quiet)
+        loopback = AudioLevelNormalizer().process(quiet)
+        self.assertAlmostEqual(float(microphone[0]), .002, places=6)
+        self.assertGreater(float(loopback[0]), float(microphone[0]) * 5)
+
     def test_invalid_and_out_of_range_input_stays_finite(self):
         output = AudioLevelNormalizer().process(np.array([np.nan, np.inf, -12., 10.], np.float32))
         self.assertTrue(np.isfinite(output).all())

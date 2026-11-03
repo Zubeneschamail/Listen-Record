@@ -34,9 +34,9 @@ def clean_tool_history(history):
     return cleaned
 
 
-def reference_partial(text):
+def reference_partial(text, scenario=False):
     """Hold an incomplete opening, tool protocol, and unexecuted read promises."""
-    if has_tool_markup(text) or promises_reference_read(text):
+    if has_tool_markup(text) or promises_reference_read(text, scenario):
         return ''
     visible = visible_partial(text)
     # Wait for a clause or a short opening so a fragmented "让我现在读取…"
@@ -63,8 +63,32 @@ def current_question(text, depth=0):
     return text
 
 
-def promises_reference_read(answer):
+def asks_about_personal_experience(prompt):
+    """Use the current question, never background transcripts, to select a resume."""
+    question = current_question(prompt).strip()
+    if re.search(r'(?:不要|不用|无需|不需要|别).{0,12}(?:简历|履历|资料|文件)', question):
+        return False
+    return bool(re.search(
+        r'简历|履历|自我介绍|工作经历|工作经验|项目经历|职业经历|个人经历|'
+        r'(?:你|我)在.{1,24}(?:做|负责|开发|工作|任职|项目|公司|团队|经历)|'
+        r'(?:你|我)的(?:工作|项目|经历|职责|技术栈|背景|团队|公司)|'
+        r'(?:你|我)(?:做过|负责|参与)|你们(?:项目|团队|公司)|'
+        r'(?:介绍|讲讲|说说|谈谈|说下).{0,12}(?:自己|项目|工作|经历|职责)|'
+        r'(?:做过|遇到过|处理过|实践|经验).{0,12}(?:并发|秒杀|缓存|事务|调优)|'
+        r'(?:高并发|秒杀|库存超卖).{0,16}(?:怎么|如何|处理|设计|解决)|'
+        r'(?:怎么|如何).{0,16}(?:高并发|秒杀|库存超卖)',
+        question))
+
+
+def promises_reference_read(answer, scenario=False):
     text = re.sub(r'```.*?```', '', answer, flags=re.S)
+    if scenario:
+        # In an interview, "我会先查日志" describes a troubleshooting method,
+        # not a request for this application to access the machine. Still catch
+        # actual promises to read the supplied references or delay the answer.
+        text = '\n'.join(clause for clause in re.split(r'(?<=[。！？\n])', text)
+                         if re.search(r'资料|参考|简历|知识包|README|稍等|等我|'
+                                      r'\br\d+/|\b(?:reference|resume|wait)\b', clause, re.I))
     # Only first-person plans, not completed reads, user instructions or quotations.
     return bool(re.search(
         r'(?:^|[。！？\n])\s*(?:让我|我(?:现在|马上|这就|接下来|会|将|先|来)|'
