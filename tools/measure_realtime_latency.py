@@ -25,7 +25,7 @@ def main():
     parser.add_argument('--interview-flow', action='store_true',
                         help='Verify a paused long question with local automatic Q&A (no API)')
     parser.add_argument('--dual-source', action='store_true',
-                        help='Also capture a synthetic candidate interruption on the microphone track')
+                        help='Also capture a second synthetic speaker on the microphone track')
     args = parser.parse_args()
     if args.dual_source and not args.interview_flow:
         parser.error('--dual-source requires --interview-flow')
@@ -246,7 +246,7 @@ def main():
             assert auto_questions[0]['seconds'] >= speech_end, 'Automatic Q&A started before speech ended'
             assert auto_questions[0]['question'] == '\n'.join(o['value']['text'] for o in finals), 'Submitted question missed a transcript part'
         if args.dual_source:
-            assert result['candidate_context_preserved'], 'Candidate speech must remain background context'
+            assert result['candidate_context_preserved'], 'Microphone speech must remain background context'
 
 
 if __name__ == '__main__':

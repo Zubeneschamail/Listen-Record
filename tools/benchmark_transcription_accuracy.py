@@ -93,7 +93,7 @@ def main():
         parser.error('manifest must contain at least one labeled audio sample')
     sounds = [decode_audio(case['audio'], sampling_rate=RATE) for case in cases]
     report = dict(source='labeled audio' if args.manifest else 'Chinese SAPI synthetic fixtures',
-                  limitation=('A small labeled set does not establish overall interview accuracy.' if args.manifest else
+                  limitation=('Results from a small labeled set are specific to the samples tested.' if args.manifest else
                               'Synthetic speech does not measure real-world accents or microphone noise.'),
                   hotwords_enabled=not args.without_hotwords, results=[], summaries=[],
                   metrics=dict(cer='Legacy case-folded alphanumeric character error rate',

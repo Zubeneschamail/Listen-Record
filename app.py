@@ -928,7 +928,7 @@ class App:
         generation = self.qa.generation
         self.qa.set_question_source(source)
         if self.qa.generation != generation:
-            self.qa_status.set('面试官音源已更新，等待新问题…')
+            self.qa_status.set('提问音源已更新，等待新问题…')
 
     def save_desktop_settings(self, force=False, raise_errors=False, *, save_recognition=True):
         if self.settings_visible and not force:

@@ -69,7 +69,7 @@ def main():
     (args.output/'provenance.json').write_text(json.dumps(dict(
         source=SOURCE, revision=REVISION, selection='Evenly spaced rows; selected before inference',
         purpose='Local ASR evaluation using source reference prompt recordings and matched transcripts',
-        limitation='20 general/expressive Chinese utterances, not a representative technical interview corpus',
+        limitation='The sample contains 20 general or expressive Chinese utterances',
         license_sha256=hashlib.sha256(license_data).hexdigest(), files=provenance),
         ensure_ascii=False, indent=2), encoding='utf-8')
 

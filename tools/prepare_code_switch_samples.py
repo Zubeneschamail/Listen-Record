@@ -129,7 +129,7 @@ def main():
                       purpose='Local evaluation only; no training or application bundling',
                       selection='Before ASR: 24 mixed + 8 Chinese + 8 English, 2–12 seconds; no [UNK] annotations; round-robin speakers',
                       source_rows_with_unknown_annotations=sum('[UNK]' in item['row']['transcription'].upper() for item in rows),
-                      limitation='Spontaneous general conversation, not a technical interview population estimate',
+                      limitation='The sample covers spontaneous general conversation',
                       languages=dict(Counter(item['group'] for item in cases)),
                       speakers=dict(Counter(item['speaker'] for item in cases)),
                       topics=dict(Counter(item['topic'] for item in cases)), files=files)

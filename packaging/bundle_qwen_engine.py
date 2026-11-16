@@ -58,7 +58,7 @@ def bundle(runtime, models, output):
         'Qwen3-ASR-0.6B and Qwen3-ForcedAligner-0.6B: Apache-2.0, Qwen team.\n'
         'Official model cards and provenance are included under models/.\n'
         'PyTorch, Transformers and other runtime licenses are retained in _internal/.\n'
-        'No interview recordings, evaluation corpus or customer knowledge packages are included.\n',encoding='utf-8')
+        'No user recordings, evaluation corpus or customer knowledge packages are included.\n',encoding='utf-8')
     shutil.copy2(ROOT/'packaging/licenses/Apache-2.0.txt',stage/'LICENSE-Qwen-models.txt')
     files={p.relative_to(stage).as_posix():dict(bytes=p.stat().st_size,sha256=sha(p))
            for p in sorted(stage.rglob('*')) if p.is_file()}

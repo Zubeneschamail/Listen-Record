@@ -89,7 +89,7 @@ def build_settings(app, button):
     app.language.pack(fill='x')
     field = ui.row(audio, '热词 / 纠错')
     app.hotwords = tk.StringVar(value=read_preferences(DATA / 'recognition-settings.json'))
-    presets = ttk.Menubutton(field, text='面试术语')
+    presets = ttk.Menubutton(field, text='术语预设')
     app.hotwords_presets = tk.Menu(presets, tearoff=False)
     for topic in INTERVIEW_HOTWORDS:
         app.hotwords_presets.add_command(label=topic, command=lambda topic=topic:
@@ -147,11 +147,11 @@ def build_settings(app, button):
     app.settings_auto_qa = tk.BooleanVar(value=app.auto_qa.get())
     ttk.Checkbutton(field, text='自动读取转录问题和剪贴板', variable=app.settings_auto_qa).pack(side='left')
     from qa_worker import QUESTION_SOURCES
-    field = ui.row(ai, '面试官音源')
+    field = ui.row(ai, '提问音源')
     app.question_source = ui.combo(field, values=list(QUESTION_SOURCES))
     app.question_source.current(0)
     app.question_source.pack(fill='x')
-    ui.note(ai, '自动时优先系统声音；仅采集麦克风时使用麦克风。另一方的声音仅作上下文。').pack(anchor='w', pady=(2, 6))
+    ui.note(ai, '自动时优先系统声音；仅采集麦克风时使用麦克风。未选中的音源仅提供上下文。').pack(anchor='w', pady=(2, 6))
     ui.note(ai, variable=app.clipboard_status).pack(anchor='w', pady=(2, 6))
     ui.note(ai, '内容会发送给所选模型服务并按服务商计费；重启后自动答疑关闭。').pack(anchor='w', pady=(0, 12))
     ui.section(ai, '屏幕提问')
